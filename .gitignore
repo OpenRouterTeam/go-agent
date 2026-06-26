@@ -1,0 +1,11 @@
+# Go build artifacts
+/bin/
+/dist/
+*.test
+*.out
+coverage.txt
+
+# Local environment
+.env
+.env.*
+!.env.example
