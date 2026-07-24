@@ -36,8 +36,13 @@ jobs:
       # Deterministic tests. e2e_test.go skips without OPENROUTER_API_KEY.
       - run: go test ./...
 
-  # Runs the port's own mechanical gate on PRs that touch the port machinery, so
-  # a broken verifier or contract is caught here rather than mid-sync.
+  # Reports the port's own mechanical gate. Advisory here, BLOCKING inside the
+  # sync job (scripts/upstream) where it gates whether state.yaml advances.
+  #
+  # Advisory on purpose: the port is currently a minor version behind upstream, so
+  # the required-API check fails by design until the first sync lands. Making that
+  # a red required check on every unrelated PR just teaches people to ignore CI.
+  # The signal still shows up in the job summary.
   verify-port:
     runs-on: ubuntu-latest
     timeout-minutes: 15
@@ -45,5 +50,27 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: ./.github/actions/port-toolchain
-      - name: Port verifier
-        run: ./.upstreamer/scripts/verify.sh
+      - name: Port verifier (advisory)
+        id: verify
+        continue-on-error: true
+        run: |
+          set -o pipefail
+          ./.upstreamer/scripts/verify.sh 2>&1 | tee /tmp/verify.log
+
+      - name: Summarize
+        if: always()
+        run: |
+          {
+            echo "## Port verifier"
+            echo
+            if [ "${{ steps.verify.outcome }}" = "success" ]; then
+              echo "Port is in sync with its parity floor."
+            else
+              echo "Parity gaps below. Expected until the port catches up to upstream —"
+              echo "advisory here, blocking inside the sync job."
+            fi
+            echo
+            echo '```'
+            cat /tmp/verify.log 2>/dev/null || echo "(no output)"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
