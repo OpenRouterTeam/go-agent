@@ -1,0 +1,49 @@
+name: CI
+
+# This repo had no CI. Without it the port verifier's go test/vet calls only ever
+# ran inside the sync job, so a generated PR reached review with no independent
+# signal. This runs the same checks on every PR and push.
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.25"
+          cache: true
+
+      - name: gofmt
+        run: |
+          unformatted=$(gofmt -l . | grep -v '^tmp/' || true)
+          if [ -n "$unformatted" ]; then
+            echo "::error::gofmt needed: $unformatted"
+            exit 1
+          fi
+
+      - run: go build ./...
+      - run: go vet ./...
+
+      # Deterministic tests. e2e_test.go skips without OPENROUTER_API_KEY.
+      - run: go test ./...
+
+  # Runs the port's own mechanical gate on PRs that touch the port machinery, so
+  # a broken verifier or contract is caught here rather than mid-sync.
+  verify-port:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    if: github.event_name == 'pull_request'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/port-toolchain
+      - name: Port verifier
+        run: ./.upstreamer/scripts/verify.sh

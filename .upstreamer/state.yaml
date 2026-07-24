@@ -1,0 +1,6 @@
+# Last upstream commit successfully ported AND verified AND eval-passed.
+# Seeded at @openrouter/agent@0.7.2 (commit adc7939), the release these ports
+# were generated from, so the first run is an incremental 0.7.2 -> 0.8.0 delta
+# rather than a full from-scratch regeneration.
+# Only scripts/upstream runs should change this.
+upstream_commit: adc7939f4b7ed85b1a060d13433b8be6063cff73

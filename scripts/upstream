@@ -1,0 +1,173 @@
+#!/usr/bin/env bash
+# Upstreamer wrapper, adapted from mountgram/upstreamer (MIT) for in-repo downstream.
+#
+# Difference from upstream tool: mountgram/upstreamer writes generated output to
+# codebases/<name>/downstream/ inside the upstreamer repo. Here THIS repo is the
+# downstream, so output is written in place at the repo root and reviewed as a PR.
+#
+# Usage:
+#   scripts/upstream                 # sync if upstream changed
+#   scripts/upstream --force         # re-run even if unchanged (after editing the contract)
+#   scripts/upstream --ref v1.2.3    # port a specific upstream ref instead of origin/HEAD
+#   scripts/upstream -- --print-logs # pass extra args through to opencode
+set -euo pipefail
+
+cd "$(dirname "$0")/.."
+repo_root="$PWD"
+
+contract=".upstreamer/upstreamer.md"
+state_file=".upstreamer/state.yaml"
+eval_file=".upstreamer/eval.md"
+eval_report_file=".upstreamer/eval-report.md"
+verifier=".upstreamer/scripts/verify.sh"
+env_file=".upstreamer/port.env"
+work_dir="tmp/upstreamer"
+upstream_dir="$work_dir/upstream"
+log_dir=".upstreamer/logs"
+
+force=0
+ref=""
+while [ "$#" -gt 0 ]; do
+  case "${1:-}" in
+    --force) force=1; shift ;;
+    --ref) ref="${2:-}"; shift 2 ;;
+    -h|--help) sed -n '4,12p' "$0"; exit 0 ;;
+    --) shift; break ;;
+    *) break ;;
+  esac
+done
+
+[ -f "$contract" ] || { echo "ERROR: missing contract: $contract" >&2; exit 2; }
+
+# Local secrets/model choice. Never committed; CI supplies the same names as env.
+# shellcheck disable=SC1090
+if [ -f "$env_file" ]; then set -a; . "./$env_file"; set +a; fi
+
+read_frontmatter_field() {
+  local field="$1" line line_number=0 value
+  while IFS= read -r line; do
+    line_number=$((line_number + 1))
+    if [ "$line_number" -eq 1 ]; then [ "$line" = "---" ] || return 0; continue; fi
+    [ "$line" = "---" ] && return 0
+    case "$line" in
+      "$field":*)
+        value="${line#"$field":}"
+        value="${value#"${value%%[![:space:]]*}"}"
+        value="${value%"${value##*[![:space:]]}"}"
+        value="${value%\"}"; value="${value#\"}"
+        value="${value%\'}"; value="${value#\'}"
+        printf '%s\n' "$value"; return 0 ;;
+    esac
+  done < "$contract"
+}
+
+upstream_repo="$(read_frontmatter_field upstream)"
+frontmatter_model="$(read_frontmatter_field model)"
+[ -n "$upstream_repo" ] || { echo "ERROR: contract has no 'upstream:' field" >&2; exit 2; }
+
+# Model precedence: OPENCODE_MODEL env (or port.env) > contract frontmatter.
+model="${OPENCODE_MODEL:-$frontmatter_model}"
+model_args=()
+[ -n "$model" ] && model_args=(--model "$model")
+
+# opencode reads credentials from auth.json. Seed it from OPENROUTER_API_KEY so
+# headless CI and local runs work without the interactive /connect flow.
+if [ -n "${OPENROUTER_API_KEY:-}" ]; then
+  auth_dir="${XDG_DATA_HOME:-$HOME/.local/share}/opencode"
+  mkdir -p "$auth_dir"
+  if [ ! -f "$auth_dir/auth.json" ] || ! grep -q '"openrouter"' "$auth_dir/auth.json" 2>/dev/null; then
+    printf '{"openrouter":{"type":"api","key":"%s"}}\n' "$OPENROUTER_API_KEY" > "$auth_dir/auth.json"
+    chmod 600 "$auth_dir/auth.json"
+  fi
+fi
+
+mkdir -p "$work_dir" "$log_dir"
+export TMPDIR="$repo_root/$work_dir"
+log_file="$log_dir/$(date -u +%Y%m%dT%H%M%SZ).log"
+
+last_upstream_commit=""
+if [ -f "$state_file" ]; then
+  last_upstream_commit="$(awk -F: '$1 == "upstream_commit" { gsub(/^[[:space:]]+|[[:space:]]+$/, "", $2); print $2; exit }' "$state_file")"
+fi
+
+upstream_url="$upstream_repo"
+case "$upstream_url" in
+  http://*|https://*|git@*) ;;
+  *) upstream_url="https://github.com/$upstream_url.git" ;;
+esac
+
+if [ -d "$upstream_dir/.git" ]; then
+  git -C "$upstream_dir" remote set-url origin "$upstream_url"
+  git -C "$upstream_dir" fetch --tags --force origin
+else
+  rm -rf "$upstream_dir"
+  git clone "$upstream_url" "$upstream_dir"
+fi
+
+if [ -n "$ref" ]; then
+  target_commit="$(git -C "$upstream_dir" rev-parse "$ref^{commit}")"
+else
+  target_commit="$(git -C "$upstream_dir" rev-parse origin/HEAD 2>/dev/null || git -C "$upstream_dir" rev-parse origin/main)"
+fi
+git -C "$upstream_dir" checkout -q --detach "$target_commit"
+
+echo "upstream:  $upstream_repo" >&2
+echo "target:    $target_commit${ref:+ ($ref)}" >&2
+echo "last port: ${last_upstream_commit:-none}" >&2
+echo "model:     ${model:-<opencode default>}" >&2
+
+if [ "$force" -eq 0 ] && [ "$target_commit" = "$last_upstream_commit" ]; then
+  {
+    echo "Run summary"
+    echo "==========="
+    echo "Upstream changes since last run: none."
+    echo "Downstream changes made: none."
+    echo "Upstream commit: $target_commit"
+    if [ -x "$verifier" ]; then
+      echo; echo "Running verifier: $verifier"
+      "$verifier"
+    fi
+  } 2>&1 | tee "$log_file"
+  exit "${PIPESTATUS[0]}"
+fi
+
+command -v opencode >/dev/null 2>&1 || { echo "ERROR: opencode not installed" >&2; exit 127; }
+
+prompt_file="$work_dir/prompt.txt"
+cat > "$prompt_file" <<EOF
+Use the upstreamer-converter skill at @.upstreamer/skills/upstreamer-converter/SKILL.md to port the upstream repository defined by the contract at @$contract into THIS repository.
+
+IMPORTANT: this repository IS the downstream. Write ported source in place at the repo root exactly where the contract's output-shape section says, not into a downstream/ subdirectory. The upstream checkout is at @$upstream_dir and is already checked out at the target commit. Use @$work_dir for scratch work. Do not write outside this workspace.
+
+Upstream target commit: $target_commit
+Last successfully ported upstream commit: ${last_upstream_commit:-none}
+Force: $force
+
+If a last commit exists and force is 0, this is an INCREMENTAL port. Run 'git -C $upstream_dir diff --name-status ${last_upstream_commit:-HEAD}..$target_commit' first, restrict work to what actually changed plus its downstream consequences, and leave unrelated ported code alone. If no last commit exists or force is 1, reconcile the whole ported surface against the contract's required public API list.
+
+Treat @$contract as binding. Then:
+1. Port the upstream delta into this repo's language, honoring every naming-map and idiomatic-divergence rule in the contract.
+2. Update or add tests covering the newly ported behavior.
+3. Run the mechanical verifier: $verifier
+4. Run the qualitative parity eval at @$eval_file in a FRESH subagent or separate review context that reads the upstream reference and this repo directly, not your own prior reasoning. Write the result to @$eval_report_file.
+5. Fix violations and re-run. Do not paper over a real parity gap.
+
+Only after the verifier passes AND the eval returns PASS or PASS WITH WARNINGS, update @$state_file with:
+upstream_commit: $target_commit
+
+If the eval still fails after three focused fix attempts, or no coherent fix exists within the contract, declare bankruptcy: do NOT update @$state_file, write the failure, attempted fixes, and recommended human action to @$eval_report_file, and say clearly in the final report that the eval failed. A stale state file is the correct outcome for a failed port; it makes the next run retry.
+
+Begin the final report with a "Run summary" section covering: upstream changes since the last ported commit, what you changed in this repo, why those choices follow the contract, verifier result, and eval result. Also update @upstreamer-changelog.md at the repo root with user-facing release-note bullets. Keep sync bookkeeping (commit hashes, state.yaml, verifier internals) out of that changelog.
+
+This is a non-interactive run. Do not wait for follow-up instructions. If blocked, write a final report explaining the blocker and stop. Exit when the final report is complete.
+EOF
+prompt="$(cat "$prompt_file")"
+
+echo "Writing opencode log to $log_file" >&2
+
+if [ -n "${UPSTREAMER_TIMEOUT_SECONDS:-}" ]; then
+  perl -e 'alarm shift; exec @ARGV' "$UPSTREAMER_TIMEOUT_SECONDS" \
+    opencode "${model_args[@]}" "$@" run "$prompt" 2>&1 | tee "$log_file"
+else
+  opencode "${model_args[@]}" "$@" run "$prompt" 2>&1 | tee "$log_file"
+fi

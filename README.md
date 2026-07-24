@@ -2,6 +2,9 @@
 
 go-agent is an idiomatic Go port of `@openrouter/agent`: a small orchestration layer on top of the official OpenRouter Go SDK for tool execution, streaming response consumption, multi-turn state, approval gates, tool context, stop conditions, and Claude/Chat format compatibility.
 
+> **This package is a port.** `@openrouter/agent` (TypeScript) is the reference
+> spec; this repo is kept in sync automatically. See [PORTING.md](PORTING.md).
+
 ## Install
 
 ```bash
