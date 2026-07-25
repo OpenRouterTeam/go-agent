@@ -72,12 +72,35 @@ model_args=()
 
 # opencode reads credentials from auth.json. Seed it from OPENROUTER_API_KEY so
 # headless CI and local runs work without the interactive /connect flow.
+#
+# An explicitly-provided key always wins: if you put a key in port.env, that is
+# the key that gets used, even when an openrouter credential already exists from
+# a previous `opencode /connect`. Silently preferring the stored one makes
+# "why is it still using the old key" nearly impossible to debug.
+#
+# Other providers in auth.json are preserved — only the openrouter entry is
+# replaced.
 if [ -n "${OPENROUTER_API_KEY:-}" ]; then
   auth_dir="${XDG_DATA_HOME:-$HOME/.local/share}/opencode"
+  auth_file="$auth_dir/auth.json"
   mkdir -p "$auth_dir"
-  if [ ! -f "$auth_dir/auth.json" ] || ! grep -q '"openrouter"' "$auth_dir/auth.json" 2>/dev/null; then
-    printf '{"openrouter":{"type":"api","key":"%s"}}\n' "$OPENROUTER_API_KEY" > "$auth_dir/auth.json"
-    chmod 600 "$auth_dir/auth.json"
+  if OPENROUTER_API_KEY="$OPENROUTER_API_KEY" AUTH_FILE="$auth_file" python3 - <<'PYAUTH'
+import json, os, pathlib
+path = pathlib.Path(os.environ["AUTH_FILE"])
+try:
+    data = json.loads(path.read_text())
+    if not isinstance(data, dict):
+        data = {}
+except Exception:
+    data = {}
+data["openrouter"] = {"type": "api", "key": os.environ["OPENROUTER_API_KEY"]}
+path.write_text(json.dumps(data, indent=2) + "\n")
+path.chmod(0o600)
+PYAUTH
+  then
+    echo "auth:      openrouter credential set from OPENROUTER_API_KEY" >&2
+  else
+    echo "WARNING: could not write $auth_file; falling back to whatever opencode has stored" >&2
   fi
 fi
 
