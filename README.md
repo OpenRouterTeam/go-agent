@@ -2,6 +2,9 @@
 
 go-agent is an idiomatic Go port of `@openrouter/agent`: a small orchestration layer on top of the official OpenRouter Go SDK for tool execution, streaming response consumption, multi-turn state, approval gates, tool context, stop conditions, and Claude/Chat format compatibility.
 
+> **This package is a port.** `@openrouter/agent` (TypeScript) is the reference
+> spec; this repo is kept in sync automatically. See [PORTING.md](PORTING.md).
+
 ## Install
 
 ```bash
@@ -77,11 +80,36 @@ Tool input schemas are generated from Go structs with `invopop/jsonschema`, sani
 
 ## State, Approval, And Context
 
-Use `CreateInitialState`, `AppendToMessages`, `UpdateState`, `PartitionToolCalls`, and `StateAccessor` to persist multi-turn conversations. Approval checks can be configured per tool or per call; resume by passing `ApproveToolCalls` or `RejectToolCalls` with the saved state. go-agent replays the original `function_call` before its `function_call_output` and carries `previous_response_id`, matching the TypeScript resume shape. `ToolContextStore` provides concurrency-safe per-tool and shared context with snapshot, get, set, merge, and subscribe operations.
+Use `CreateInitialState`, `AppendToMessages`, `UpdateState`, `PartitionToolCalls`, and `StateAccessor` to persist multi-turn conversations. Approval checks can be configured per tool or per call; resume by passing `ApproveToolCalls` or `RejectToolCalls` with the saved state. go-agent replays the original `function_call` before its `function_call_output` and carries `previous_response_id`, matching the TypeScript resume shape. `ToolContextStore` provides concurrency-safe per-tool and shared context with snapshot, get, set, merge, and subscribe operations. Unresolved manual (client-executed) tool calls pause the run with `ConversationStatusAwaitingClientTools`, distinct from `ConversationStatusAwaitingHITL`.
+
+Use `SerializeConversationState` / `DeserializeConversationState` for a versioned, durable-storage-friendly encoding of `ConversationState` (`ConversationStateVersion`). A version mismatch returns `*UnsupportedStateVersionError`; a malformed blob returns `*InvalidStateError` — callers get an explicit error instead of a silently misinterpreted state.
 
 ## Stop Conditions
 
-Use `StepCountIs`, `HasToolCall`, `MaxTokensUsed`, `MaxCost`, `FinishReasonIs`, and `IsStopConditionMet`. Multiple stop conditions are ORed, matching the TypeScript package. `MaxTokensUsed` compares cumulative `total_tokens` only. Set `AllowFinalResponse` to execute pending tools at the stop boundary and make one final no-tools request for a closing assistant message.
+Use `StepCountIs`, `HasToolCall`, `MaxTokensUsed`, `MaxCost`, `FinishReasonIs`, and `IsStopConditionMet`. Multiple stop conditions are ORed, matching the TypeScript package. `MaxTokensUsed` compares cumulative `total_tokens` only.
+
+`AllowFinalResponse` is **default-on**: when a stop condition halts the loop mid-tool-call, go-agent executes the pending tool calls and issues one more request with `tool_choice: "none"` (tools stay in the request so the prompt-cache prefix survives) so the run ends with a natural-language answer. Omitting the option, or setting it to `true`, appends `agent.DefaultFinalResponseDirective` as a final user message; a non-empty string overrides that wording; `""` forbids tool calls without appending any message; `false` disables the forced final turn entirely.
+
+## Lifecycle Hooks
+
+`HooksManager` (`agent.NewHooksManager`) supports the nine built-in lifecycle hooks — `PreToolUse`, `PostToolUse`, `PostToolUseFailure`, `UserPromptSubmit`, `Stop`, `PermissionRequest`, `SessionStart`, `SessionEnd`, and `PostModelCall` — plus fully custom hooks via the generic `agent.On`/`agent.Emit`. Register handlers with the typed `OnXxx` methods (e.g. `manager.OnPreToolUse(...)`) and pass the manager on `CallModelInput.Hooks`:
+
+```go
+hooks := agent.NewHooksManager()
+hooks.OnPreToolUse(agent.HookEntry[agent.PreToolUsePayload, agent.PreToolUseResult]{
+    Handler: func(payload agent.PreToolUsePayload, hctx agent.LifecycleHookContext) (agent.HookHandlerResult[agent.PreToolUseResult], error) {
+        return agent.VoidResult[agent.PreToolUseResult](), nil
+    },
+})
+
+result, err := agent.CallModel(ctx, client, agent.CallModelInput{
+    Model: "openai/gpt-4o-mini",
+    Input: "...",
+    Hooks: hooks,
+})
+```
+
+`SessionStart`/`SessionEnd` fire once per non-resuming run (`SessionEnd` carries aggregated token usage across that run's model calls); an approval/HITL resume call is a continuation of the same session and does not get its own pair. `PostModelCall` fires once per model response, tagged `initial`/`resume`/`tool_round`/`final`/`retry`. `PreToolUse`/`PostToolUse`/`PostToolUseFailure` fire around every client-tool execution path, including during a resume. `PermissionRequest` fires before the human-approval pause and can `allow`/`deny`/`ask_user` (default) a gated call. `Stop` fires whenever a stop condition halts the loop mid-tool-call and can force a resume and/or inject a prompt. `UserPromptSubmit` fires once per non-resuming run against the initial user input and can mutate or reject it. Session identity is threaded per emit, so one `HooksManager` is safe to share across concurrent `CallModel` runs. Call `manager.Drain()` to await fire-and-forget handler work; go-agent always drains on every exit path, including no-tools error paths.
 
 ## Format Compatibility
 

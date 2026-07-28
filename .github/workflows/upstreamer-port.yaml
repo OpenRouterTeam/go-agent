@@ -1,0 +1,162 @@
+name: Upstreamer Port
+
+# Ports @openrouter/agent into this repo. Two triggers:
+#   1. repository_dispatch from typescript-agent's publish.yaml on a new npm release
+#      (event type: openrouter-agent-published) — the intended path. Ports track
+#      published releases, not every commit to upstream main.
+#   2. Weekly cron as a safety net for missed dispatches, plus manual dispatch.
+#
+# Opens a PR. Never pushes to main. A failed parity eval leaves
+# .upstreamer/state.yaml unchanged, so the next run retries the same delta.
+
+on:
+  repository_dispatch:
+    types: [openrouter-agent-published]
+  schedule:
+    - cron: "23 6 * * 1"
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Upstream ref to port (blank = upstream default branch HEAD)"
+        required: false
+        type: string
+      force:
+        description: "Re-run even if the upstream commit is unchanged"
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: write
+  pull-requests: write
+  actions: write # to dispatch ci.yaml onto the generated PR branch
+
+concurrency:
+  group: upstreamer-port
+  cancel-in-progress: false
+
+jobs:
+  port:
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: oven-sh/setup-bun@v2
+
+      - name: Install opencode
+        run: bun install -g opencode-ai
+
+      - name: Set up language toolchain
+        uses: ./.github/actions/port-toolchain
+
+      # Ports track published releases, not upstream main. When no ref arrives
+      # (cron, or a manual dispatch with the input left blank), resolve the
+      # latest published @openrouter/agent version from the public npm registry
+      # and port its release tag. This makes the cron fully equivalent to the
+      # repository_dispatch fast path — same tag either way — so the pipeline
+      # works with no cross-repo token at all if the dispatch is unavailable.
+      - name: Resolve target ref
+        id: target
+        run: |
+          set -euo pipefail
+          REF="${{ inputs.ref || github.event.client_payload.ref }}"
+          if [ -z "$REF" ]; then
+            VERSION="$(curl -fsSL 'https://registry.npmjs.org/@openrouter%2Fagent/latest' | python3 -c 'import json,sys; print(json.load(sys.stdin)["version"])')"
+            REF="@openrouter/agent@${VERSION}"
+            echo "No ref provided — resolved latest npm release: $REF"
+          fi
+          echo "ref=$REF" >> "$GITHUB_OUTPUT"
+
+      - name: Run port
+        env:
+          # Provide these in repo settings:
+          #   Secret   OPENROUTER_API_KEY  — sk-or-... key opencode uses for inference
+          #   Variable OPENCODE_MODEL      — e.g. openrouter/~anthropic/claude-opus-latest
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+          OPENCODE_MODEL: ${{ vars.OPENCODE_MODEL }}
+          UPSTREAMER_TIMEOUT_SECONDS: 7200
+        run: |
+          set -euo pipefail
+          if [ -z "${OPENROUTER_API_KEY:-}" ]; then
+            echo "::error::OPENROUTER_API_KEY secret is not set. See .upstreamer/port.env.example."
+            exit 1
+          fi
+          args=(--ref "${{ steps.target.outputs.ref }}")
+          [ "${{ inputs.force }}" = "true" ] && args+=(--force)
+          ./scripts/upstream "${args[@]}"
+
+      - name: Check for changes
+        id: diff
+        run: |
+          if [ -n "$(git status --porcelain -- . ':!tmp')" ]; then
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "No changes — upstream unchanged or port was a no-op."
+          fi
+
+      # State only advances when the verifier AND the parity eval passed, so an
+      # unchanged state file next to a changed tree means the port did not pass.
+      # Label the PR accordingly instead of letting it look green.
+      - name: Detect eval failure
+        if: steps.diff.outputs.changed == 'true'
+        id: gate
+        run: |
+          if git diff --quiet -- .upstreamer/state.yaml; then
+            echo "passed=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::state.yaml did not advance — parity eval did not pass. See .upstreamer/eval-report.md."
+          else
+            echo "passed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Open PR
+        id: open-pr
+        if: steps.diff.outputs.changed == 'true'
+        uses: peter-evans/create-pull-request@v6
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          branch: upstreamer/sync
+          delete-branch: true
+          title: >-
+            ${{ steps.gate.outputs.passed == 'true'
+              && 'port: sync with @openrouter/agent upstream'
+              || 'port: sync with @openrouter/agent upstream (EVAL FAILED — do not merge)' }}
+          commit-message: "port: sync with @openrouter/agent upstream"
+          labels: >-
+            ${{ steps.gate.outputs.passed == 'true'
+              && 'upstreamer, automated'
+              || 'upstreamer, automated, eval-failed' }}
+          body: |
+            Automated Upstreamer port of `@openrouter/agent` into this repo.
+
+            - Contract: `.upstreamer/upstreamer.md`
+            - Run log: `.upstreamer/logs/`
+            - Parity eval: `.upstreamer/eval-report.md`
+            - Parity eval passed: **${{ steps.gate.outputs.passed }}**
+
+            Review the diff as a port, not as a normal PR: check behavioral parity
+            against the TypeScript reference, not just that it compiles. If
+            `.upstreamer/state.yaml` did not advance, the eval did not pass and this
+            PR must not be merged as-is.
+
+      # Events created with the native GITHUB_TOKEN deliberately do not trigger
+      # other workflows (GitHub's recursion guard), so the PR opened above gets
+      # no CI checks on its own. workflow_dispatch is exempt from that guard:
+      # kick ci.yaml at the PR branch explicitly. This keeps the whole pipeline
+      # on the native token — no PAT anywhere in this repo.
+      - name: Trigger CI on the port PR
+        if: steps.diff.outputs.changed == 'true' && steps.open-pr.outputs.pull-request-operation != 'none'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh workflow run ci.yaml --repo "$GITHUB_REPOSITORY" --ref upstreamer/sync
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: upstreamer-logs
+          path: .upstreamer/logs/
+          if-no-files-found: ignore

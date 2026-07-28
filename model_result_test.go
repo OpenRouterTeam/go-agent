@@ -143,12 +143,24 @@ func TestAllowFinalResponseSendsNoToolsRequestOnStop(t *testing.T) {
 	if sender.calls != 2 {
 		t.Fatalf("expected initial and final request, got %d", sender.calls)
 	}
-	if len(sender.requests[1].Tools) != 0 {
-		t.Fatalf("final response request must remove tools")
+	// Upstream #68: tools stay in the final request (removing them would
+	// bust the prompt-cache prefix); tool calls are forbidden via
+	// ToolChoice=none instead.
+	if len(sender.requests[1].Tools) != 1 {
+		t.Fatalf("final response request must keep tools in place, got %d", len(sender.requests[1].Tools))
+	}
+	if sender.requests[1].ToolChoice == nil || sender.requests[1].ToolChoice.OpenAIResponsesToolChoiceNone == nil {
+		t.Fatalf("final response request must forbid tool calls via ToolChoice=none, got %#v", sender.requests[1].ToolChoice)
 	}
 	items := sender.requests[1].Input.ArrayOfInputsUnion1
-	if len(items) < 3 || items[0].EasyInputMessage == nil || (items[1].FunctionCallItem == nil && items[1].OutputFunctionCallItem == nil) || items[2].FunctionCallOutputItem == nil {
+	if len(items) < 4 || items[0].EasyInputMessage == nil || (items[1].FunctionCallItem == nil && items[1].OutputFunctionCallItem == nil) || items[2].FunctionCallOutputItem == nil {
 		t.Fatalf("final request should preserve original input, function_call, and output, got %#v", items)
+	}
+	// bare `true` appends the default final-answer directive (upstream #68).
+	directive := items[3].EasyInputMessage
+	content, ok := directive.Content.GetOrZero()
+	if directive == nil || !ok || content.Str == nil || *content.Str != DefaultFinalResponseDirective {
+		t.Fatalf("expected default final-answer directive to be appended, got %#v", items[3])
 	}
 }
 

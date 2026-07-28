@@ -5,7 +5,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
+	"strings"
 	"sync"
+	"time"
 
 	openrouter "github.com/OpenRouterTeam/go-sdk"
 	"github.com/OpenRouterTeam/go-sdk/models/components"
@@ -15,32 +18,58 @@ import (
 
 type GetResponseOptions struct{ Refresh bool }
 
+// DefaultFinalResponseDirective is appended as a final user message on the
+// forced final turn (AllowFinalResponse defaulting to on, or explicitly
+// true). Forbidding tools via ToolChoice=none alone is not enough: models
+// that emit tool-call syntax as text (e.g. GLM) will attempt another call
+// and leak it into content as unparsed text unless they are told this is the
+// final turn. Pass a non-empty string to AllowFinalResponse to override the
+// wording, or "" to append no message at all (legacy behavior).
+const DefaultFinalResponseDirective = "You have reached the tool-use limit, and tools are no longer available. Do not attempt to call any more tools. Using the information you already have, write your final answer now."
+
+// sessionUsageAggregate accumulates ModelCallUsage across every model call in a run.
+type sessionUsageAggregate struct {
+	modelCalls      int
+	inputTokens     int64
+	outputTokens    int64
+	totalTokens     int64
+	cachedTokens    int64
+	reasoningTokens int64
+	cost            float64
+	hasCost         bool
+}
+
 type ModelResult struct {
-	ctx             context.Context
-	client          ResponseSender
-	input           CallModelInput
-	req             components.ResponsesRequest
-	store           *ToolContextStore
-	once            sync.Once
-	done            chan struct{}
-	mu              sync.RWMutex
-	resp            components.OpenResponsesResult
-	state           ConversationState
-	steps           []StepResult
-	toolCalls       []ParsedToolCall
-	err             error
-	textStream      *ReusableStream[string]
-	reasoningStream *ReusableStream[string]
-	toolStream      *ReusableStream[ToolStreamEvent]
-	toolCallStream  *ReusableStream[ParsedToolCall]
-	fullStream      *ReusableStream[ResponseStreamEvent]
-	newMessages     *ReusableStream[components.InputsUnion1]
-	cancel          context.CancelFunc
+	ctx                 context.Context
+	client              ResponseSender
+	input               CallModelInput
+	req                 components.ResponsesRequest
+	store               *ToolContextStore
+	once                sync.Once
+	done                chan struct{}
+	mu                  sync.RWMutex
+	resp                components.OpenResponsesResult
+	state               ConversationState
+	steps               []StepResult
+	toolCalls           []ParsedToolCall
+	err                 error
+	textStream          *ReusableStream[string]
+	reasoningStream     *ReusableStream[string]
+	toolStream          *ReusableStream[ToolStreamEvent]
+	toolCallStream      *ReusableStream[ParsedToolCall]
+	fullStream          *ReusableStream[ResponseStreamEvent]
+	newMessages         *ReusableStream[components.InputsUnion1]
+	cancel              context.CancelFunc
+	hooksManager        *HooksManager
+	sessionStartEmitted bool
+	sessionEndEmitted   bool
+	sessionUsage        sessionUsageAggregate
+	toolRoundsExecuted  int
 }
 
 func newModelResult(ctx context.Context, client ResponseSender, input CallModelInput, req components.ResponsesRequest, state ConversationState) *ModelResult {
 	ctx2, cancel := context.WithCancel(ctx)
-	return &ModelResult{ctx: ctx2, cancel: cancel, client: client, input: input, req: req, state: state, store: NewToolContextStore(input.Context), done: make(chan struct{}), textStream: NewReusableStream[string](), reasoningStream: NewReusableStream[string](), toolStream: NewReusableStream[ToolStreamEvent](), toolCallStream: NewReusableStream[ParsedToolCall](), fullStream: NewReusableStream[ResponseStreamEvent](), newMessages: NewReusableStream[components.InputsUnion1]()}
+	return &ModelResult{ctx: ctx2, cancel: cancel, client: client, input: input, req: req, state: state, store: NewToolContextStore(input.Context), done: make(chan struct{}), textStream: NewReusableStream[string](), reasoningStream: NewReusableStream[string](), toolStream: NewReusableStream[ToolStreamEvent](), toolCallStream: NewReusableStream[ParsedToolCall](), fullStream: NewReusableStream[ResponseStreamEvent](), newMessages: NewReusableStream[components.InputsUnion1](), hooksManager: ResolveHooks(input.Hooks)}
 }
 
 func NewModelResultFromResponse(resp components.OpenResponsesResult) *ModelResult {
@@ -164,6 +193,17 @@ func (m *ModelResult) run() {
 		m.fullStream.Complete(m.err)
 		m.newMessages.Complete(m.err)
 	}()
+	// Session teardown must run on every exit path — success, early return,
+	// or error — so fire-and-forget hook work from a run that fails before
+	// any tool ever executes (a "no-tools" path) is still drained. Never
+	// masks m.err: finishHooksSession only logs its own failures.
+	defer func() {
+		reason := SessionEndReasonComplete
+		if m.err != nil {
+			reason = SessionEndReasonError
+		}
+		m.finishHooksSession(reason)
+	}()
 	if m.client == nil {
 		return
 	}
@@ -173,13 +213,47 @@ func (m *ModelResult) run() {
 		maxTurns = 5
 	}
 	steps := []StepResult{}
+	isResume := false
+	forceResumeCount := 0
+	// An approval/HITL resume-with-decisions bypasses SessionStart/
+	// UserPromptSubmit entirely (upstream model-result.ts:2506-2515: "This
+	// path bypasses the SessionStart block below but still fires tool hooks
+	// [PreToolUse/PostToolUse] during the resume"). It is a continuation of
+	// the same logical session, not a fresh one — SessionEnd's own
+	// !sessionStartEmitted guard then makes it correctly a no-op too, while
+	// PostModelCall/PreToolUse/PostToolUse still fire during the resume via
+	// their own call sites below, and finishHooksSession's unconditional
+	// defer still drains any pending async hook work.
 	if isAwaitingResume(m.state) && (len(m.input.ApproveToolCalls) > 0 || len(m.input.RejectToolCalls) > 0) {
+		if m.hooksManager != nil {
+			m.hooksManager.SetSessionID(m.state.ID)
+		}
 		paused, err := m.prepareResumeRequest(&req)
 		if err != nil {
 			m.err = err
 			return
 		}
 		if paused {
+			// The resume itself left calls pending (not every approved/
+			// rejected decision resolved the round) — persist the updated
+			// state before returning, mirroring upstream's
+			// processApprovalDecisions, which calls saveStateSafely
+			// unconditionally regardless of whether the result still has
+			// calls pending. Without this, a StateAccessor-backed caller
+			// that reloads on the next CallModel call would see the stale
+			// pre-resume state and could re-execute an already-decided call.
+			if m.input.StateAccessor != nil {
+				if err := m.input.StateAccessor.Save(m.ctx, m.state); err != nil {
+					m.err = err
+				}
+			}
+			return
+		}
+		isResume = true
+	} else {
+		m.emitSessionStartOnce()
+		if err := m.maybeRunUserPromptSubmit(&req); err != nil {
+			m.err = err
 			return
 		}
 	}
@@ -191,6 +265,7 @@ func (m *ModelResult) run() {
 			}
 		}
 		m.fullStream.Push(ResponseStreamEvent{Type: "turn.start", Turn: turn})
+		turnStartedAt := time.Now()
 		res, err := m.client.SendResponse(m.ctx, req, m.input.MetadataLevel, operations.WithSetHeaders(map[string]string{"x-openrouter-callmodel": "true"}))
 		if err != nil {
 			m.err = err
@@ -212,6 +287,15 @@ func (m *ModelResult) run() {
 			m.err = err
 			return
 		}
+		turnType := ModelCallTurnTypeToolRound
+		if turn == 0 {
+			if isResume {
+				turnType = ModelCallTurnTypeResume
+			} else {
+				turnType = ModelCallTurnTypeInitial
+			}
+		}
+		m.emitPostModelCall(resp, turnStartedAt, turnType, turn+1)
 		text := ExtractTextFromResponse(resp)
 		if len(events) == 0 && text != "" {
 			m.textStream.Push(text)
@@ -253,79 +337,122 @@ func (m *ModelResult) run() {
 			m.err = err
 			return
 		} else if stop {
-			if !allowFinalResponseEnabled(m.input.AllowFinalResponse) {
-				m.state.Status = ConversationStatusComplete
-				break
-			}
-			approved, pending, err := PartitionToolCalls(m.ctx, m.input.Tools, calls, BuildTurnContext(nil, turn, &req), m.input.Approval)
+			resume, err := m.runStopHook(&req, forceResumeCount)
 			if err != nil {
 				m.err = err
 				return
 			}
-			if len(pending) > 0 {
-				unsent, err := m.executeAutoApproveTools(approved, turn, &req)
+			if resume {
+				// A Stop-hook handler forced resumption (optionally after
+				// injecting an AppendPrompt message). Do NOT treat this as a
+				// halt: fall through to the same tool-execution + continue
+				// path used when stopWhen didn't fire at all, so the run
+				// proceeds with a fresh model call next iteration.
+				forceResumeCount++
+			} else {
+				forceResumeCount = 0
+				if !allowFinalResponseEnabled(m.input.AllowFinalResponse) {
+					m.state.Status = ConversationStatusComplete
+					break
+				}
+				approved, pending, err := PartitionToolCalls(m.ctx, m.input.Tools, calls, BuildTurnContext(nil, turn, &req), m.input.Approval)
 				if err != nil {
 					m.err = err
 					return
 				}
-				m.state.UnsentToolResults = append(m.state.UnsentToolResults, unsent...)
-				m.state.PendingToolCalls = pending
-				m.state.Status = ConversationStatusAwaitingApproval
+				var deniedOutputs []components.InputsUnion1
+				if len(pending) > 0 {
+					gateApproved, stillPending, gateDenied, gateErr := m.applyPermissionRequestGate(pending)
+					if gateErr != nil {
+						m.err = gateErr
+						return
+					}
+					approved = append(approved, gateApproved...)
+					deniedOutputs = gateDenied
+					if len(stillPending) > 0 {
+						unsent, err := m.executeAutoApproveTools(approved, turn, &req)
+						if err != nil {
+							m.err = err
+							return
+						}
+						m.state.UnsentToolResults = append(m.state.UnsentToolResults, unsent...)
+						m.state.PendingToolCalls = stillPending
+						m.state.Status = ConversationStatusAwaitingApproval
+						break
+					}
+				}
+				outputs, err := m.executeToolCallsForTurn(approved, turn, &req)
+				if err != nil {
+					m.err = err
+					return
+				}
+				outputs = append(outputs, deniedOutputs...)
+				if isPausedStatus(m.state.Status) {
+					break
+				}
+				finalResp, err := m.sendFinalResponseRequest(req, resp, outputs, turn+1)
+				if err != nil {
+					m.err = err
+					return
+				}
+				m.mu.Lock()
+				m.resp = finalResp
+				m.steps = append(m.steps, StepResult{Text: ExtractTextFromResponse(finalResp), Response: finalResp, Usage: usagePtr(finalResp), FinishReason: string(finalResp.Status)})
+				m.mu.Unlock()
+				finalItems, err := responseInputItemsWithError(finalResp)
+				if err != nil {
+					m.err = err
+					return
+				}
+				m.state = appendResponseItemsToState(m.state, finalResp, finalItems)
+				m.state.Status = ConversationStatusComplete
 				break
 			}
-			outputs, err := m.executeToolCallsForTurn(approved, turn, &req)
-			if err != nil {
-				m.err = err
-				return
-			}
-			if m.state.Status == ConversationStatusInterrupted || m.state.Status == ConversationStatusAwaitingHITL {
-				break
-			}
-			finalResp, err := m.sendFinalResponseRequest(req, resp, outputs, turn+1)
-			if err != nil {
-				m.err = err
-				return
-			}
-			m.mu.Lock()
-			m.resp = finalResp
-			m.steps = append(m.steps, StepResult{Text: ExtractTextFromResponse(finalResp), Response: finalResp, Usage: usagePtr(finalResp), FinishReason: string(finalResp.Status)})
-			m.mu.Unlock()
-			finalItems, err := responseInputItemsWithError(finalResp)
-			if err != nil {
-				m.err = err
-				return
-			}
-			m.state = appendResponseItemsToState(m.state, finalResp, finalItems)
-			m.state.Status = ConversationStatusComplete
-			break
 		}
 		approved, pending, err := PartitionToolCalls(m.ctx, m.input.Tools, calls, BuildTurnContext(nil, turn, &req), m.input.Approval)
 		if err != nil {
 			m.err = err
 			return
 		}
+		var deniedOutputs []components.InputsUnion1
 		if len(pending) > 0 {
-			// Mixed approval turn (Run-2 punch-list item 14): execute the
-			// auto-approved calls and persist their outputs as unsent results
-			// *before* pausing for the approval-required calls, matching
-			// upstream handleApprovalCheck -> executeAutoApproveTools ordering.
-			unsent, err := m.executeAutoApproveTools(approved, turn, &req)
-			if err != nil {
-				m.err = err
+			gateApproved, stillPending, gateDenied, gateErr := m.applyPermissionRequestGate(pending)
+			if gateErr != nil {
+				m.err = gateErr
 				return
 			}
-			m.state.UnsentToolResults = append(m.state.UnsentToolResults, unsent...)
-			m.state.PendingToolCalls = pending
-			m.state.Status = ConversationStatusAwaitingApproval
-			break
+			approved = append(approved, gateApproved...)
+			deniedOutputs = gateDenied
+			if len(stillPending) > 0 {
+				// Mixed approval turn (Run-2 punch-list item 14): execute the
+				// auto-approved calls and persist their outputs as unsent results
+				// *before* pausing for the approval-required calls, matching
+				// upstream handleApprovalCheck -> executeAutoApproveTools ordering.
+				unsent, err := m.executeAutoApproveTools(approved, turn, &req)
+				if err != nil {
+					m.err = err
+					return
+				}
+				m.state.UnsentToolResults = append(m.state.UnsentToolResults, unsent...)
+				m.state.PendingToolCalls = stillPending
+				m.state.Status = ConversationStatusAwaitingApproval
+				break
+			}
 		}
 		outputs, err := m.executeToolCallsForTurn(approved, turn, &req)
 		if err != nil {
 			m.err = err
 			return
 		}
-		if m.state.Status == ConversationStatusInterrupted || m.state.Status == ConversationStatusAwaitingHITL {
+		outputs = append(outputs, deniedOutputs...)
+		if isPausedStatus(m.state.Status) {
 			break
+		}
+		if len(outputs) > 0 {
+			// A tool round with observable progress resets the consecutive
+			// forceResume counter so an earlier override doesn't count
+			// against a later, independent one (mirrors upstream).
+			forceResumeCount = 0
 		}
 		base := requestInputItems(req.Input)
 		base = append(base, responseItems...)
@@ -336,11 +463,53 @@ func (m *ModelResult) run() {
 			m.state.PreviousResponseID = &resp.ID
 		}
 	}
+	// Mini-class models intermittently return an empty final turn after a
+	// successful tool round (the tool call itself was the answer). Retry
+	// once so a completed run doesn't surface an empty answer when the model
+	// simply needs a nudge. StrictFinalResponse opts out of the retry
+	// (legacy behavior): unlike upstream, this never turns into a hard
+	// error — go-sdk's OpenResponsesResult carries a separate `OutputText`
+	// convenience field alongside `Output` items, so an empty `Output` array
+	// is not on its own a reliable "invalid response" signal the way it is
+	// upstream, where `output` is the sole content carrier. See
+	// upstreamer-changelog.md for this compatibility note.
+	if m.state.Status == ConversationStatusComplete && m.toolRoundsExecuted > 0 && !m.input.StrictFinalResponse && isEmptyFinalResponse(m.resp) {
+		retryResp, err := m.retryCurrentRequest(req, len(m.steps)+1)
+		if err != nil {
+			m.err = err
+			return
+		}
+		m.mu.Lock()
+		m.resp = retryResp
+		m.steps = append(m.steps, StepResult{Text: ExtractTextFromResponse(retryResp), Response: retryResp, Usage: usagePtr(retryResp), FinishReason: string(retryResp.Status)})
+		m.mu.Unlock()
+		retryItems, err := responseInputItemsWithError(retryResp)
+		if err != nil {
+			m.err = err
+			return
+		}
+		m.state = appendResponseItemsToState(m.state, retryResp, retryItems)
+	}
 	if m.input.StateAccessor != nil {
 		if err := m.input.StateAccessor.Save(m.ctx, m.state); err != nil {
 			m.err = err
 		}
 	}
+}
+
+// isEmptyFinalResponse reports whether resp carries no assistant-visible
+// content at all: no Output items and no text via ExtractTextFromResponse
+// (which also checks the SDK's OutputText convenience field).
+func isEmptyFinalResponse(resp components.OpenResponsesResult) bool {
+	return len(resp.Output) == 0 && ExtractTextFromResponse(resp) == ""
+}
+
+// isPausedStatus reports whether status represents a mid-turn pause that
+// should stop the loop without sending a (necessarily incomplete) follow-up
+// request: an interruption, a HITL pause, or unresolved manual/client tool
+// calls (upstream #64's awaiting_client_tools).
+func isPausedStatus(status ConversationStatus) bool {
+	return status == ConversationStatusInterrupted || status == ConversationStatusAwaitingHITL || status == ConversationStatusAwaitingClientTools
 }
 
 func consumeCreateResponse(res *operations.CreateResponsesResponse, onEvent func(components.StreamEvents)) (components.OpenResponsesResult, []components.StreamEvents, error) {
@@ -385,17 +554,14 @@ func isAwaitingResume(state ConversationState) bool {
 	return state.Status == ConversationStatusAwaitingApproval || state.Status == ConversationStatusAwaitingHITL
 }
 
+// allowFinalResponseEnabled reports whether the forced final ("toolChoice:
+// none") turn is enabled for v. Default-on: nil, bare true, and any string
+// (including "") enable it; only explicit `false` opts out (upstream #68).
 func allowFinalResponseEnabled(v any) bool {
-	switch x := v.(type) {
-	case nil:
-		return false
-	case bool:
-		return x
-	case string:
-		return true
-	default:
-		return false
+	if b, ok := v.(bool); ok {
+		return b
 	}
+	return true
 }
 
 func callKey(call ParsedToolCall) string {
@@ -429,22 +595,33 @@ func (m *ModelResult) prepareResumeRequest(req *components.ResponsesRequest) (bo
 				unsent = append(unsent, CreateRejectedResult(call, "Tool not found or not executable"))
 				continue
 			}
-			result, err := ExecuteTool(m.ctx, t, call, BuildToolExecuteContext(call, BuildTurnContext(nil, turn, req), m.store, func(v any) {
-				m.toolStream.Push(ToolStreamEvent{Type: "tool.preliminary", CallID: call.CallID, Name: call.Name, Event: v, Turn: turn})
-			}))
+			source := ToolSourceClient
+			if IsMcpTool(t) {
+				source = ToolSourceMCP
+			}
+			execCtx := BuildToolExecuteContext(call, BuildTurnContext(nil, turn, req), m.store, func(v any) {
+				m.toolStream.Push(ToolStreamEvent{Type: "tool.preliminary", CallID: call.CallID, Name: call.Name, Source: source, Event: v, Turn: turn})
+			})
+			effectiveCall, result, blocked, err := m.runToolWithHooks(t, call, execCtx)
 			if err != nil {
 				return false, err
 			}
+			m.toolRoundsExecuted++
+			if blocked {
+				unsent = append(unsent, CreateRejectedResult(effectiveCall, result.Error.Error()))
+				m.toolStream.Push(ToolStreamEvent{Type: "tool.result", CallID: call.CallID, Name: call.Name, Source: source, Error: result.Error.Error(), Turn: turn})
+				continue
+			}
 			if errors.Is(result.Error, ErrHITLPause) {
-				remaining = append(remaining, call)
+				remaining = append(remaining, effectiveCall)
 				continue
 			}
 			if result.Error != nil {
-				unsent = append(unsent, CreateRejectedResult(call, result.Error.Error()))
+				unsent = append(unsent, CreateRejectedResult(effectiveCall, result.Error.Error()))
 			} else {
-				unsent = append(unsent, CreateUnsentResult(call, result.Output))
+				unsent = append(unsent, CreateUnsentResult(effectiveCall, result.Output))
 			}
-			m.toolStream.Push(ToolStreamEvent{Type: "tool.result", CallID: call.CallID, Name: call.Name, Result: result.Output, Turn: turn})
+			m.toolStream.Push(ToolStreamEvent{Type: "tool.result", CallID: call.CallID, Name: call.Name, Source: source, Result: result.Output, Turn: turn})
 		default:
 			remaining = append(remaining, call)
 		}
@@ -490,6 +667,50 @@ func (m *ModelResult) prepareResumeRequest(req *components.ResponsesRequest) (bo
 //
 // A HITL tool that pauses (returns ErrHITLPause) yields no unsent result for
 // that call this round, matching upstream's null return.
+// applyPermissionRequestGate runs the PermissionRequest hook for each tool
+// call that needs human approval, letting hooks short-circuit the approval
+// flow in either direction: `allow` promotes the call past the gate (so the
+// normal round executes it once, appended to approved), `deny` synthesizes a
+// rejection (appended to deniedOutputs as a ready-to-send output item —
+// there's no pause to persist it against, so it must be sent this round, not
+// stashed as an UnsentToolResult), `ask_user` (the default, and always the
+// decision when no HooksManager is configured) falls through to the human
+// approval flow (left in stillPending, which the caller should pause on if
+// non-empty).
+func (m *ModelResult) applyPermissionRequestGate(pending []ParsedToolCall) (approved []ParsedToolCall, stillPending []ParsedToolCall, deniedOutputs []components.InputsUnion1, err error) {
+	if m.hooksManager == nil {
+		return nil, pending, nil, nil
+	}
+	var denied []UnsentToolResult
+	for _, call := range pending {
+		decision, reason, hookErr := m.emitPermissionRequest(call)
+		if hookErr != nil {
+			return nil, nil, nil, hookErr
+		}
+		switch decision {
+		case PermissionDecisionAllow:
+			approved = append(approved, call)
+		case PermissionDecisionDeny:
+			if reason == "" {
+				reason = "Denied by PermissionRequest hook"
+			}
+			denied = append(denied, CreateRejectedResult(call, reason))
+		default:
+			stillPending = append(stillPending, call)
+		}
+	}
+	if len(denied) > 0 {
+		deniedOutputs, err = UnsentResultsToAPIFormatWithError(denied)
+		if err != nil {
+			return nil, nil, nil, err
+		}
+		for _, item := range deniedOutputs {
+			m.state = AppendToMessages(m.state, item)
+		}
+	}
+	return approved, stillPending, deniedOutputs, nil
+}
+
 func (m *ModelResult) executeAutoApproveTools(calls []ParsedToolCall, turn int, req *components.ResponsesRequest) ([]UnsentToolResult, error) {
 	var results []UnsentToolResult
 	for _, call := range calls {
@@ -499,24 +720,33 @@ func (m *ModelResult) executeAutoApproveTools(calls []ParsedToolCall, turn int, 
 			// returns null and contributes no unsent result this round).
 			continue
 		}
+		source := ToolSourceClient
+		if IsMcpTool(t) {
+			source = ToolSourceMCP
+		}
 		execCtx := BuildToolExecuteContext(call, BuildTurnContext(nil, turn, req), m.store, func(v any) {
-			m.toolStream.Push(ToolStreamEvent{Type: "tool.preliminary", CallID: call.CallID, Name: call.Name, Event: v, Turn: turn})
+			m.toolStream.Push(ToolStreamEvent{Type: "tool.preliminary", CallID: call.CallID, Name: call.Name, Source: source, Event: v, Turn: turn})
 		})
-		result, err := ExecuteTool(m.ctx, t, call, execCtx)
+		effectiveCall, result, blocked, err := m.runToolWithHooks(t, call, execCtx)
 		if err != nil {
 			return nil, err
+		}
+		m.toolRoundsExecuted++
+		if blocked {
+			results = append(results, CreateRejectedResult(effectiveCall, result.Error.Error()))
+			continue
 		}
 		if errors.Is(result.Error, ErrHITLPause) {
 			// HITL tool paused during auto-approve — no unsent result this round.
 			continue
 		}
 		if result.Error != nil {
-			results = append(results, CreateRejectedResult(call, result.Error.Error()))
+			results = append(results, CreateRejectedResult(effectiveCall, result.Error.Error()))
 			continue
 		}
-		event := ToolStreamEvent{Type: "tool.result", CallID: call.CallID, Name: call.Name, Result: result.Output, Turn: turn}
+		event := ToolStreamEvent{Type: "tool.result", CallID: call.CallID, Name: call.Name, Source: source, Result: result.Output, Turn: turn}
 		m.toolStream.Push(event)
-		results = append(results, CreateUnsentResult(call, result.Output))
+		results = append(results, CreateUnsentResult(effectiveCall, result.Output))
 	}
 	return results, nil
 }
@@ -535,23 +765,44 @@ func (m *ModelResult) executeToolCallsForTurn(calls []ParsedToolCall, turn int, 
 	for _, call := range calls {
 		t := FindToolByName(m.input.Tools, call.Name)
 		if t == nil || IsManualTool(t) {
+			// Unresolved manual (client-executed) tool call: neither an
+			// `execute` fn nor an `OnToolCalled` hook. Persist as
+			// awaiting_client_tools (upstream #64) rather than the generic
+			// `interrupted` status, so callers can discriminate "the caller
+			// must execute this externally" from an arbitrary interruption.
 			m.state.PendingToolCalls = append(m.state.PendingToolCalls, call)
-			m.state.Status = ConversationStatusInterrupted
+			m.state.Status = ConversationStatusAwaitingClientTools
 			continue
 		}
+		source := ToolSourceClient
+		if IsMcpTool(t) {
+			source = ToolSourceMCP
+		}
 		execCtx := BuildToolExecuteContext(call, BuildTurnContext(nil, turn, req), m.store, func(v any) {
-			m.toolStream.Push(ToolStreamEvent{Type: "tool.preliminary", CallID: call.CallID, Name: call.Name, Event: v, Turn: turn})
+			m.toolStream.Push(ToolStreamEvent{Type: "tool.preliminary", CallID: call.CallID, Name: call.Name, Source: source, Event: v, Turn: turn})
 		})
-		result, err := ExecuteTool(m.ctx, t, call, execCtx)
+		effectiveCall, result, blocked, err := m.runToolWithHooks(t, call, execCtx)
 		if err != nil {
 			return nil, err
 		}
+		m.toolRoundsExecuted++
+		if blocked {
+			out, ferr := FormatToolOutputWithError(result)
+			if ferr != nil {
+				return nil, ferr
+			}
+			m.toolStream.Push(ToolStreamEvent{Type: "tool.result", CallID: call.CallID, Name: call.Name, Source: source, Error: result.Error.Error(), Turn: turn})
+			outputItem := components.CreateInputsUnion1FunctionCallOutputItem(out)
+			outputs = append(outputs, outputItem)
+			m.state = AppendToMessages(m.state, outputItem)
+			continue
+		}
 		if errors.Is(result.Error, ErrHITLPause) {
-			m.state.PendingToolCalls = append(m.state.PendingToolCalls, call)
+			m.state.PendingToolCalls = append(m.state.PendingToolCalls, effectiveCall)
 			m.state.Status = ConversationStatusAwaitingHITL
 			break
 		}
-		event := ToolStreamEvent{Type: "tool.result", CallID: call.CallID, Name: call.Name, Result: result.Output, Turn: turn}
+		event := ToolStreamEvent{Type: "tool.result", CallID: call.CallID, Name: call.Name, Source: source, Result: result.Output, Turn: turn}
 		if result.Error != nil {
 			event.Error = result.Error.Error()
 		}
@@ -560,7 +811,7 @@ func (m *ModelResult) executeToolCallsForTurn(calls []ParsedToolCall, turn int, 
 		if err != nil {
 			return nil, err
 		}
-		m.toolStream.Push(ToolStreamEvent{Type: "tool.call.output", CallID: call.CallID, Name: call.Name, Output: result.Output, Error: event.Error, Turn: turn})
+		m.toolStream.Push(ToolStreamEvent{Type: "tool.call.output", CallID: call.CallID, Name: call.Name, Source: source, Output: result.Output, Error: event.Error, Turn: turn})
 		outputItem := components.CreateInputsUnion1FunctionCallOutputItem(out)
 		outputs = append(outputs, outputItem)
 		// Persist this output to state immediately so it survives a later HITL
@@ -570,9 +821,32 @@ func (m *ModelResult) executeToolCallsForTurn(calls []ParsedToolCall, turn int, 
 	return outputs, nil
 }
 
+// finalResponseDirective resolves the AllowFinalResponse option to the
+// directive text appended as a final user message: default-on (nil) and
+// bare true get DefaultFinalResponseDirective; a string (including "")
+// overrides the wording — "" means "append nothing".
+func finalResponseDirective(v any) string {
+	if s, ok := v.(string); ok {
+		return s
+	}
+	return DefaultFinalResponseDirective
+}
+
+// noneToolChoice is the API tool_choice value that forbids tool calls while
+// leaving `tools` in the request — stripping `tools` entirely would bust the
+// prompt-cache prefix.
+func noneToolChoice() *components.OpenAIResponsesToolChoiceUnion {
+	choice := components.CreateOpenAIResponsesToolChoiceUnionOpenAIResponsesToolChoiceNone(components.OpenAIResponsesToolChoiceNoneNone)
+	return &choice
+}
+
 func (m *ModelResult) sendFinalResponseRequest(req components.ResponsesRequest, resp components.OpenResponsesResult, outputs []components.InputsUnion1, turn int) (components.OpenResponsesResult, error) {
 	finalReq := req
-	finalReq.Tools = nil
+	// Forbid tool calls without dropping `tools` — removing it would
+	// invalidate the prompt-cache prefix (upstream #68).
+	if len(finalReq.Tools) > 0 {
+		finalReq.ToolChoice = noneToolChoice()
+	}
 	base := requestInputItems(req.Input)
 	items, err := responseInputItemsWithError(resp)
 	if err != nil {
@@ -580,12 +854,13 @@ func (m *ModelResult) sendFinalResponseRequest(req components.ResponsesRequest, 
 	}
 	base = append(base, items...)
 	base = append(base, outputs...)
-	if s, ok := m.input.AllowFinalResponse.(string); ok && s != "" {
-		msg := components.EasyInputMessage{Role: components.CreateEasyInputMessageRoleUnionEasyInputMessageRoleUser(components.EasyInputMessageRoleUserUser), Content: optionalnullable.From(openrouter.Pointer(components.CreateEasyInputMessageContentUnion2Str(s)))}
+	if directive := finalResponseDirective(m.input.AllowFinalResponse); directive != "" {
+		msg := components.EasyInputMessage{Role: components.CreateEasyInputMessageRoleUnionEasyInputMessageRoleUser(components.EasyInputMessageRoleUserUser), Content: optionalnullable.From(openrouter.Pointer(components.CreateEasyInputMessageContentUnion2Str(directive)))}
 		base = append(base, components.CreateInputsUnion1EasyInputMessage(msg))
 	}
 	finalReq.Input = openrouter.Pointer(components.CreateInputsUnionArrayOfInputsUnion1(base))
 	m.fullStream.Push(ResponseStreamEvent{Type: "turn.start", Turn: turn})
+	startedAt := time.Now()
 	res, err := m.client.SendResponse(m.ctx, finalReq, m.input.MetadataLevel, operations.WithSetHeaders(map[string]string{"x-openrouter-callmodel": "true"}))
 	if err != nil {
 		return components.OpenResponsesResult{}, err
@@ -599,6 +874,7 @@ func (m *ModelResult) sendFinalResponseRequest(req components.ResponsesRequest, 
 	if err != nil {
 		return components.OpenResponsesResult{}, err
 	}
+	m.emitPostModelCall(finalResp, startedAt, ModelCallTurnTypeFinal, turn)
 	text := ExtractTextFromResponse(finalResp)
 	if len(events) == 0 && text != "" {
 		m.textStream.Push(text)
@@ -608,12 +884,418 @@ func (m *ModelResult) sendFinalResponseRequest(req components.ResponsesRequest, 
 	return finalResp, nil
 }
 
+// retryCurrentRequest re-sends req (the same accumulated input) once, used
+// when a follow-up after tool execution returned an empty output array.
+// ToolChoice is forced to none when tools are present (mirroring
+// sendFinalResponseRequest) so the retry coerces a text turn instead of
+// risking a fresh (unexecuted) function_call.
+func (m *ModelResult) retryCurrentRequest(req components.ResponsesRequest, turn int) (components.OpenResponsesResult, error) {
+	retryReq := req
+	if len(retryReq.Tools) > 0 {
+		retryReq.ToolChoice = noneToolChoice()
+	}
+	m.fullStream.Push(ResponseStreamEvent{Type: "turn.start", Turn: turn})
+	startedAt := time.Now()
+	res, err := m.client.SendResponse(m.ctx, retryReq, m.input.MetadataLevel, operations.WithSetHeaders(map[string]string{"x-openrouter-callmodel": "true"}))
+	if err != nil {
+		return components.OpenResponsesResult{}, err
+	}
+	retryResp, events, err := consumeCreateResponse(res, func(ev components.StreamEvents) {
+		if ev.TextDeltaEvent != nil {
+			m.textStream.Push(ev.TextDeltaEvent.Delta)
+		}
+		m.fullStream.Push(ResponseStreamEvent{Type: "response.event", Turn: turn, Event: &ev})
+	})
+	if err != nil {
+		return components.OpenResponsesResult{}, err
+	}
+	m.emitPostModelCall(retryResp, startedAt, ModelCallTurnTypeRetry, turn)
+	text := ExtractTextFromResponse(retryResp)
+	if len(events) == 0 && text != "" {
+		m.textStream.Push(text)
+	}
+	m.fullStream.Push(ResponseStreamEvent{Type: "response.completed", Turn: turn, Response: &retryResp})
+	m.fullStream.Push(ResponseStreamEvent{Type: "turn.end", Turn: turn})
+	return retryResp, nil
+}
+
 func usagePtr(resp components.OpenResponsesResult) *components.Usage {
 	if usage, ok := resp.Usage.GetOrZero(); ok {
 		return &usage
 	}
 	return nil
 }
+
+// extractModelCallUsage converts an SDK Usage into the hooks ModelCallUsage
+// shape, or nil when resp carried no usage at all.
+func extractModelCallUsage(resp components.OpenResponsesResult) *ModelCallUsage {
+	usage := usagePtr(resp)
+	if usage == nil {
+		return nil
+	}
+	out := &ModelCallUsage{
+		InputTokens:     usage.InputTokens,
+		OutputTokens:    usage.OutputTokens,
+		TotalTokens:     usage.TotalTokens,
+		CachedTokens:    usage.InputTokensDetails.CachedTokens,
+		ReasoningTokens: usage.OutputTokensDetails.ReasoningTokens,
+	}
+	if cost, ok := usage.Cost.GetOrZero(); ok {
+		out.Cost = &cost
+	}
+	return out
+}
+
+// hookEmitOptions builds the per-emit EmitOptions for lifecycle hook emits.
+// Threads this run's session identity into every emit so a HooksManager
+// instance shared across concurrent runs never leaks one run's id into
+// another's handlers (the manager-level SetSessionID default is a single
+// mutable field and would be clobbered by the last run to start).
+func (m *ModelResult) hookEmitOptions(toolName string) EmitOptions {
+	return EmitOptions{ToolName: toolName, SessionID: m.state.ID}
+}
+
+// emitSessionStartOnce emits SessionStart exactly once per run.
+func (m *ModelResult) emitSessionStartOnce() {
+	if m.hooksManager == nil || m.sessionStartEmitted {
+		return
+	}
+	m.sessionStartEmitted = true
+	m.hooksManager.SetSessionID(m.state.ID)
+	if _, err := m.hooksManager.EmitSessionStart(SessionStartPayload{}, m.hookEmitOptions("")); err != nil {
+		log.Printf("[SessionStart] hook error: %v", err)
+	}
+}
+
+// emitSessionEndOnce emits SessionEnd exactly once, and only when a matching
+// SessionStart actually fired. Safe to call from multiple teardown paths;
+// never returns an error since teardown must not mask the run's own outcome.
+func (m *ModelResult) emitSessionEndOnce(reason SessionEndReason) {
+	if m.hooksManager == nil || !m.sessionStartEmitted || m.sessionEndEmitted {
+		return
+	}
+	m.sessionEndEmitted = true
+	payload := SessionEndPayload{Reason: reason}
+	if m.sessionUsage.modelCalls > 0 {
+		totals := SessionUsageTotals{
+			ModelCallUsage: ModelCallUsage{
+				InputTokens:     m.sessionUsage.inputTokens,
+				OutputTokens:    m.sessionUsage.outputTokens,
+				TotalTokens:     m.sessionUsage.totalTokens,
+				CachedTokens:    m.sessionUsage.cachedTokens,
+				ReasoningTokens: m.sessionUsage.reasoningTokens,
+			},
+			ModelCalls: m.sessionUsage.modelCalls,
+		}
+		if m.sessionUsage.hasCost {
+			cost := m.sessionUsage.cost
+			totals.Cost = &cost
+		}
+		payload.TotalUsage = &totals
+	}
+	if _, err := m.hooksManager.EmitSessionEnd(payload, m.hookEmitOptions("")); err != nil {
+		log.Printf("[SessionEnd] hook error: %v", err)
+	}
+}
+
+// finishHooksSession emits SessionEnd (if not already emitted) and drains
+// pending hook work. Never panics: teardown must not mask the run's own
+// error. Call unconditionally on every exit path (success or error) so
+// fire-and-forget hook work is never silently dropped — including no-tools
+// paths that error before any tool ever runs.
+func (m *ModelResult) finishHooksSession(reason SessionEndReason) {
+	if m.hooksManager == nil {
+		return
+	}
+	m.emitSessionEndOnce(reason)
+	m.hooksManager.Drain()
+}
+
+// emitPostModelCall emits PostModelCall for a completed model response and
+// folds its usage into the session aggregate. One emit per materialized response.
+func (m *ModelResult) emitPostModelCall(resp components.OpenResponsesResult, startedAt time.Time, turnType ModelCallTurnType, turnNumber int) {
+	if m.hooksManager == nil {
+		return
+	}
+	usage := extractModelCallUsage(resp)
+	m.sessionUsage.modelCalls++
+	if usage != nil {
+		m.sessionUsage.inputTokens += usage.InputTokens
+		m.sessionUsage.outputTokens += usage.OutputTokens
+		m.sessionUsage.totalTokens += usage.TotalTokens
+		m.sessionUsage.cachedTokens += usage.CachedTokens
+		m.sessionUsage.reasoningTokens += usage.ReasoningTokens
+		if usage.Cost != nil {
+			m.sessionUsage.cost += *usage.Cost
+			m.sessionUsage.hasCost = true
+		}
+	}
+	payload := PostModelCallPayload{
+		SessionID:  m.state.ID,
+		ResponseID: resp.ID,
+		Model:      resp.Model,
+		DurationMs: float64(time.Since(startedAt).Milliseconds()),
+		TurnType:   turnType,
+		TurnNumber: turnNumber,
+		Usage:      usage,
+	}
+	if _, err := m.hooksManager.EmitPostModelCall(payload, m.hookEmitOptions("")); err != nil {
+		log.Printf("[PostModelCall] hook error: %v", err)
+	}
+}
+
+// maxForceResumeOverrides caps consecutive Stop-hook forceResume overrides so
+// a misbehaving handler cannot spin the loop forever.
+const maxForceResumeOverrides = 3
+
+// runStopHook emits the Stop hook when a stopWhen condition halts the loop,
+// and decides whether the loop should resume.
+//
+//   - AppendPrompt values from all handlers are concatenated (newline
+//     separated) and injected as a user message, independently of ForceResume.
+//   - ForceResume is honored if ANY handler returns it, capped at
+//     maxForceResumeOverrides consecutive overrides without tool progress.
+//
+// Returns true when the loop should resume, false to stop for real. No
+// HooksManager means "no hook to consult" -> always stop.
+func (m *ModelResult) runStopHook(req *components.ResponsesRequest, forceResumeCount int) (bool, error) {
+	if m.hooksManager == nil {
+		return false, nil
+	}
+
+	stopResult, err := m.hooksManager.EmitStop(StopPayload{Reason: StopReasonMaxTurns}, m.hookEmitOptions(""))
+	if err != nil {
+		return false, fmt.Errorf("Stop hook: %w", err)
+	}
+
+	shouldForceResume := false
+	var appendPrompts []string
+	for _, r := range stopResult.Results {
+		if r.ForceResume {
+			shouldForceResume = true
+		}
+		if r.AppendPrompt != "" {
+			appendPrompts = append(appendPrompts, r.AppendPrompt)
+		}
+	}
+	if len(appendPrompts) > 0 {
+		m.injectAppendPromptMessage(req, strings.Join(appendPrompts, "\n"))
+	}
+
+	if !shouldForceResume {
+		return false, nil
+	}
+	if forceResumeCount >= maxForceResumeOverrides {
+		// Don't let the hook loop the engine forever. Log and stop.
+		log.Printf("[Stop hook] forceResume honored %d times without new progress; stopping to prevent an infinite loop.", maxForceResumeOverrides)
+		return false, nil
+	}
+	return true, nil
+}
+
+// injectAppendPromptMessage appends prompt as a user message to both the
+// in-memory conversation state (so progress is observable even without a
+// StateAccessor — a bare ForceResume needs state to change to avoid looping)
+// and the in-flight request's accumulated input (so it reaches the next
+// model call).
+func (m *ModelResult) injectAppendPromptMessage(req *components.ResponsesRequest, prompt string) {
+	msg := components.EasyInputMessage{Role: components.CreateEasyInputMessageRoleUnionEasyInputMessageRoleUser(components.EasyInputMessageRoleUserUser), Content: optionalnullable.From(openrouter.Pointer(components.CreateEasyInputMessageContentUnion2Str(prompt)))}
+	item := components.CreateInputsUnion1EasyInputMessage(msg)
+	m.state = AppendToMessages(m.state, item)
+
+	base := requestInputItems(req.Input)
+	base = append(base, item)
+	req.Input = openrouter.Pointer(components.CreateInputsUnionArrayOfInputsUnion1(base))
+}
+
+// emitPermissionRequest emits the PermissionRequest hook before the SDK
+// blocks for user approval. Returns the hook's collective decision:
+// allow (proceed as if auto-approved), deny (synthesize a rejection without
+// running the tool), or ask_user (fall through to the existing approval
+// flow — the default, and what a nil HooksManager always returns).
+// Last-wins when multiple handlers return conflicting decisions.
+func (m *ModelResult) emitPermissionRequest(call ParsedToolCall) (PermissionDecision, string, error) {
+	if m.hooksManager == nil {
+		return PermissionDecisionAskUser, "", nil
+	}
+	// Raw-string arguments mean the model produced invalid JSON. Fail closed
+	// (fall through to the human approval flow) rather than emitting a
+	// malformed payload — mirrors the guard in runToolWithHooks.
+	if call.RawArgs != "" && call.Arguments == nil {
+		if _, ok := toolInputFromRawArgs(call.RawArgs); !ok {
+			return PermissionDecisionAskUser, "", nil
+		}
+	}
+
+	// Derive risk level from the approval gate's shape: a callback (tool- or
+	// call-level requireApproval function) => high (caller actively decides
+	// per call), blanket true => medium, otherwise low.
+	t := FindToolByName(m.input.Tools, call.Name)
+	riskLevel := RiskLevelLow
+	if m.input.Approval != nil {
+		riskLevel = RiskLevelHigh
+	} else if t != nil {
+		if approvalTool, ok := t.(interface {
+			RequiresApproval(context.Context, ParsedToolCall, TurnContext) (bool, error)
+		}); ok {
+			if req, err := approvalTool.RequiresApproval(m.ctx, call, TurnContext{}); err == nil && req {
+				riskLevel = RiskLevelMedium
+			}
+		}
+	}
+
+	emit, err := m.hooksManager.EmitPermissionRequest(PermissionRequestPayload{ToolName: call.Name, ToolInput: toolInputMap(call), RiskLevel: riskLevel}, m.hookEmitOptions(call.Name))
+	if err != nil {
+		return PermissionDecisionAskUser, "", fmt.Errorf("PermissionRequest hook: %w", err)
+	}
+	if len(emit.Results) == 0 {
+		return PermissionDecisionAskUser, "", nil
+	}
+	last := emit.Results[len(emit.Results)-1]
+	return last.Decision, last.Reason, nil
+}
+
+// toolInputFromRawArgs reports whether rawArgs is valid JSON, mirroring the
+// "raw-string arguments" fail-closed guard shared by runToolWithHooks and
+// emitPermissionRequest.
+func toolInputFromRawArgs(rawArgs string) (map[string]any, bool) {
+	var decoded map[string]any
+	if err := json.Unmarshal([]byte(rawArgs), &decoded); err != nil {
+		return nil, false
+	}
+	return decoded, true
+}
+
+// maybeRunUserPromptSubmit runs the UserPromptSubmit hook against the latest
+// user-role string message in req's accumulated input (mirroring upstream's
+// extractPromptAndApplier), mutating that message's content in place when a
+// handler returns MutatedPrompt. A structured input with no plain-string
+// user message (e.g. image content, or no user message at all) has nothing
+// for the hook to inspect, so it is skipped without error — matching
+// upstream's dev-only warn-and-skip behavior.
+//
+// Returns an error if any handler rejects the prompt.
+func (m *ModelResult) maybeRunUserPromptSubmit(req *components.ResponsesRequest) error {
+	if m.hooksManager == nil || req.Input == nil {
+		return nil
+	}
+	items := requestInputItems(req.Input)
+	idx, prompt, ok := latestUserStringMessage(items)
+	if !ok {
+		return nil
+	}
+
+	emit, err := m.hooksManager.EmitUserPromptSubmit(UserPromptSubmitPayload{Prompt: prompt}, m.hookEmitOptions(""))
+	if err != nil {
+		return fmt.Errorf("UserPromptSubmit hook: %w", err)
+	}
+	if emit.Blocked {
+		reason := emit.BlockReason
+		if reason == "" {
+			reason = "Prompt rejected by hook"
+		}
+		return errors.New(reason)
+	}
+	if !emit.Mutated {
+		return nil
+	}
+	mutated := emit.FinalPayload.Prompt
+	msg := *items[idx].EasyInputMessage
+	msg.Content = optionalnullable.From(openrouter.Pointer(components.CreateEasyInputMessageContentUnion2Str(mutated)))
+	items[idx] = components.CreateInputsUnion1EasyInputMessage(msg)
+	req.Input = openrouter.Pointer(components.CreateInputsUnionArrayOfInputsUnion1(items))
+	return nil
+}
+
+// latestUserStringMessage finds the last user-role EasyInputMessage in items
+// whose content is a plain string, returning its index and text.
+func latestUserStringMessage(items []components.InputsUnion1) (int, string, bool) {
+	for i := len(items) - 1; i >= 0; i-- {
+		msg := items[i].EasyInputMessage
+		if msg == nil || msg.Role.EasyInputMessageRoleUser == nil {
+			continue
+		}
+		content, ok := msg.Content.GetOrZero()
+		if !ok || content.Str == nil {
+			continue
+		}
+		return i, *content.Str, true
+	}
+	return -1, "", false
+}
+
+// runToolWithHooks executes one tool call and emits the PreToolUse/
+// PostToolUse/PostToolUseFailure lifecycle hooks around it, so every
+// execution path (auto-approve, manual approval, approved-on-resume) fires
+// them consistently. Returns the (possibly input-mutated) call actually
+// executed, the execution result, whether PreToolUse blocked execution (in
+// which case result carries a synthetic rejection and the tool never ran),
+// and a fatal (non-tool) error such as a request-encoding failure — this
+// last one should abort the run exactly like a direct ExecuteTool error
+// would, not be treated as a per-call rejection.
+func (m *ModelResult) runToolWithHooks(t Tool, call ParsedToolCall, execCtx ToolExecuteContext) (effectiveCall ParsedToolCall, result ToolExecutionResult, blocked bool, fatalErr error) {
+	effectiveCall = call
+	if m.hooksManager == nil {
+		res, err := ExecuteTool(m.ctx, t, effectiveCall, execCtx)
+		if err != nil {
+			return effectiveCall, ToolExecutionResult{}, false, err
+		}
+		return effectiveCall, res, false, nil
+	}
+
+	toolInput := toolInputMap(call)
+	preResult, err := m.hooksManager.EmitPreToolUse(PreToolUsePayload{ToolName: call.Name, ToolInput: toolInput}, m.hookEmitOptions(call.Name))
+	if err != nil {
+		return effectiveCall, ToolExecutionResult{}, false, fmt.Errorf("PreToolUse hook: %w", err)
+	}
+	if preResult.Blocked {
+		reason := preResult.BlockReason
+		if reason == "" {
+			reason = "Blocked by PreToolUse hook"
+		}
+		return effectiveCall, ToolExecutionResult{CallID: call.CallID, Name: call.Name, Error: errors.New(reason)}, true, nil
+	}
+	if preResult.Mutated {
+		effectiveCall.Arguments = preResult.FinalPayload.ToolInput
+		effectiveCall.RawArgs = ""
+	}
+
+	startedAt := time.Now()
+	execCtx.ToolCall = effectiveCall
+	res, err := ExecuteTool(m.ctx, t, effectiveCall, execCtx)
+	if err != nil {
+		return effectiveCall, ToolExecutionResult{}, false, err
+	}
+	durationMs := float64(time.Since(startedAt).Milliseconds())
+
+	if res.Error != nil {
+		if _, hookErr := m.hooksManager.EmitPostToolUseFailure(PostToolUseFailurePayload{ToolName: effectiveCall.Name, ToolInput: toolInputMap(effectiveCall), Error: res.Error}, m.hookEmitOptions(effectiveCall.Name)); hookErr != nil {
+			log.Printf("[PostToolUseFailure] hook error: %v", hookErr)
+		}
+	} else {
+		if _, hookErr := m.hooksManager.EmitPostToolUse(PostToolUsePayload{ToolName: effectiveCall.Name, ToolInput: toolInputMap(effectiveCall), ToolOutput: res.Output, DurationMs: durationMs}, m.hookEmitOptions(effectiveCall.Name)); hookErr != nil {
+			log.Printf("[PostToolUse] hook error: %v", hookErr)
+		}
+	}
+	return effectiveCall, res, false, nil
+}
+
+// toolInputMap best-effort converts a ParsedToolCall's arguments to
+// map[string]any for hook payloads, coercing null/missing arguments to an
+// empty map (mirroring upstream's PreToolUse payload construction).
+func toolInputMap(call ParsedToolCall) map[string]any {
+	if m, ok := call.Arguments.(map[string]any); ok {
+		return m
+	}
+	if call.RawArgs != "" {
+		var decoded map[string]any
+		if err := json.Unmarshal([]byte(call.RawArgs), &decoded); err == nil {
+			return decoded
+		}
+	}
+	return map[string]any{}
+}
+
 func (m *ModelResult) Text(ctx context.Context) (string, error) {
 	m.ensure()
 	return ExtractTextFromResponse(m.resp), m.err

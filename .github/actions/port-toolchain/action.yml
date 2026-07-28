@@ -1,0 +1,14 @@
+name: Port toolchain (Go)
+description: Install the toolchain the port verifier needs (Go).
+
+runs:
+  using: composite
+  steps:
+    - uses: actions/setup-go@v5
+      with:
+        go-version: "1.25"
+        cache: true
+
+    - name: Download modules
+      shell: bash
+      run: go mod download

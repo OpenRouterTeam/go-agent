@@ -36,9 +36,13 @@ func ParseToolArguments(raw string) (json.RawMessage, any, error) {
 }
 
 func ExecuteTool(ctx context.Context, t Tool, call ParsedToolCall, execCtx ToolExecuteContext) (ToolExecutionResult, error) {
+	source := ToolSourceClient
+	if IsMcpTool(t) {
+		source = ToolSourceMCP
+	}
 	exec, ok := t.(ToolWithExecute)
 	if !ok {
-		return ToolExecutionResult{CallID: call.CallID, Name: call.Name, Error: ErrManualTool}, nil
+		return ToolExecutionResult{CallID: call.CallID, Name: call.Name, Source: source, Error: ErrManualTool}, nil
 	}
 	raw := json.RawMessage("{}")
 	if call.RawArgs != "" {
@@ -51,7 +55,12 @@ func ExecuteTool(ctx context.Context, t Tool, call ParsedToolCall, execCtx ToolE
 		raw = b
 	}
 	execCtx.ToolCall = call
-	return exec.Execute(ctx, raw, execCtx)
+	result, err := exec.Execute(ctx, raw, execCtx)
+	if err != nil {
+		return result, err
+	}
+	result.Source = source
+	return result, nil
 }
 
 func SanitizeSchema(schema map[string]any) map[string]any {

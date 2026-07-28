@@ -9,12 +9,22 @@ import (
 type DynamicValue[T any] func(context.Context, TurnContext) (T, error)
 
 type CallModelInput struct {
-	Model                  string
-	ModelFunc              DynamicValue[string]
-	Input                  any
-	Tools                  []Tool
-	StopWhen               []StopCondition
-	AllowFinalResponse     any
+	Model              string
+	ModelFunc          DynamicValue[string]
+	Input              any
+	Tools              []Tool
+	StopWhen           []StopCondition
+	AllowFinalResponse any
+	// StrictFinalResponse: when true, skips the one-shot retry that would
+	// otherwise fire when a completed run's final response has no output
+	// after at least one tool round. Default false: that empty final is
+	// retried once via a `toolChoice: none` resend. Either way an empty
+	// final response is never a hard error here — unlike upstream's
+	// `validateFinalResponse`, an empty `Output` items array is not on its
+	// own a reliable invalidity signal against go-sdk's response shape,
+	// which also carries a separate `OutputText` convenience field. See
+	// upstreamer-changelog.md's compatibility note.
+	StrictFinalResponse    bool
 	State                  *ConversationState
 	StateAccessor          StateAccessor
 	Context                ContextInput
@@ -28,6 +38,9 @@ type CallModelInput struct {
 	AfterTurn              func(context.Context, TurnContext, StepResult) error
 	AdditionalInstructions string
 	InstructionsFunc       DynamicValue[string]
+	// Hooks accepts either a *HooksManager or an InlineHookConfig. See
+	// ResolveHooks. nil means no hooks.
+	Hooks any
 }
 
 type CallModelInputWithState = CallModelInput

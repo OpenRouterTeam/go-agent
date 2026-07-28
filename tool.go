@@ -247,3 +247,43 @@ func deepCopyJSONValue(v any) any {
 		return x
 	}
 }
+
+// mcpBrand wraps a Tool with the additive MCP marker (see MarkMcp/IsMcpTool).
+// Non-mutating: it forwards every Tool method to the wrapped tool unchanged,
+// so runtime behavior and wire shape (ToAPITool) are identical to the
+// unmarked tool. Execute is forwarded explicitly (rather than inherited via
+// embedding, which only promotes the narrow Tool interface) so a marked
+// executable tool keeps executing normally.
+type mcpBrand struct{ Tool }
+
+func (b mcpBrand) isMcpTool() {}
+
+func (b mcpBrand) Execute(ctx context.Context, raw json.RawMessage, execCtx ToolExecuteContext) (ToolExecutionResult, error) {
+	exec, ok := b.Tool.(ToolWithExecute)
+	if !ok {
+		return ToolExecutionResult{CallID: execCtx.ToolCall.CallID, Name: b.Tool.ToolName(), Error: ErrManualTool}, nil
+	}
+	return exec.Execute(ctx, raw, execCtx)
+}
+
+// mcpMarked is implemented only by mcpBrand; IsMcpTool structurally checks
+// for it rather than requiring a cast to a concrete type.
+type mcpMarked interface{ isMcpTool() }
+
+// MarkMcp adds the additive MCP brand to an already-built client tool. The
+// tool's runtime behavior and wire shape are unchanged; only IsMcpTool's
+// classification (and downstream Source discrimination on
+// ToolExecutionResult/ToolStreamEvent) now identifies it as MCP-originated.
+// Intended for use by an MCP integration package that wraps remote tools.
+func MarkMcp(t Tool) Tool {
+	return mcpBrand{Tool: t}
+}
+
+// IsMcpTool reports whether tool carries the additive MCP brand (see MarkMcp).
+func IsMcpTool(t Tool) bool {
+	if t == nil {
+		return false
+	}
+	_, ok := t.(mcpMarked)
+	return ok
+}

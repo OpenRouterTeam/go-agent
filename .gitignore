@@ -9,3 +9,12 @@ coverage.txt
 .env
 .env.*
 !.env.example
+
+# Upstreamer port machinery
+# Upstream checkout + scratch work
+tmp/upstreamer/
+# Run logs
+.upstreamer/logs/
+# LOCAL SECRETS - never commit
+.upstreamer/port.env
+!.upstreamer/port.env.example
