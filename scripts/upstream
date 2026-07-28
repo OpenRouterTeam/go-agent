@@ -124,11 +124,19 @@ if [ -d "$upstream_dir/.git" ]; then
   git -C "$upstream_dir" fetch --tags --force origin
 else
   rm -rf "$upstream_dir"
-  git clone "$upstream_url" "$upstream_dir"
+  # --single-branch: CI recreates this clone every run, and fetching the whole
+  # ref namespace roughly doubles clone time for nothing — the script targets
+  # origin/HEAD or a release tag (reachable from the default branch, so still
+  # fetched). Refs outside that (e.g. a manual run against a feature branch)
+  # are handled by the fallback fetch below.
+  git clone --single-branch "$upstream_url" "$upstream_dir"
 fi
 
 if [ -n "$ref" ]; then
-  target_commit="$(git -C "$upstream_dir" rev-parse "$ref^{commit}")"
+  if ! target_commit="$(git -C "$upstream_dir" rev-parse --quiet --verify "$ref^{commit}")"; then
+    git -C "$upstream_dir" fetch origin "$ref"
+    target_commit="$(git -C "$upstream_dir" rev-parse FETCH_HEAD^{commit})"
+  fi
 else
   target_commit="$(git -C "$upstream_dir" rev-parse origin/HEAD 2>/dev/null || git -C "$upstream_dir" rev-parse origin/main)"
 fi
