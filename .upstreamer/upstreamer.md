@@ -1,7 +1,7 @@
 ---
 upstream: OpenRouterTeam/typescript-agent
 downstream: OpenRouterTeam/go-agent
-model: openrouter/~anthropic/claude-sonnet-latest
+model: openrouter/~anthropic/claude-opus-latest
 ---
 
 # Go Port Contract — `@openrouter/agent` → `github.com/OpenRouterTeam/go-agent`

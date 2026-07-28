@@ -96,7 +96,7 @@ Two values, same names locally and in CI:
 | Name | Where | What |
 |------|-------|------|
 | `OPENROUTER_API_KEY` | local: `.upstreamer/port.env` · CI: repo **secret** | `sk-or-…` key opencode uses for inference |
-| `OPENCODE_MODEL` | local: `.upstreamer/port.env` · CI: repo **variable** | e.g. `openrouter/~anthropic/claude-sonnet-latest` |
+| `OPENCODE_MODEL` | local: `.upstreamer/port.env` · CI: repo **variable** | e.g. `openrouter/~anthropic/claude-opus-latest` |
 
 The wrapper writes the key into `~/.local/share/opencode/auth.json` so headless
 runs work without the interactive `opencode /connect` flow.

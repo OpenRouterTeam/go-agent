@@ -55,7 +55,7 @@ jobs:
         env:
           # Provide these in repo settings:
           #   Secret   OPENROUTER_API_KEY  — sk-or-... key opencode uses for inference
-          #   Variable OPENCODE_MODEL      — e.g. openrouter/~anthropic/claude-sonnet-latest
+          #   Variable OPENCODE_MODEL      — e.g. openrouter/~anthropic/claude-opus-latest
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
           OPENCODE_MODEL: ${{ vars.OPENCODE_MODEL }}
           UPSTREAMER_TIMEOUT_SECONDS: 7200
