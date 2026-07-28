@@ -37,7 +37,7 @@ concurrency:
 jobs:
   port:
     runs-on: ubuntu-latest
-    timeout-minutes: 300
+    timeout-minutes: 150
     steps:
       - uses: actions/checkout@v4
         with:
@@ -55,10 +55,10 @@ jobs:
         env:
           # Provide these in repo settings:
           #   Secret   OPENROUTER_API_KEY  — sk-or-... key opencode uses for inference
-          #   Variable OPENCODE_MODEL      — e.g. openrouter/anthropic/claude-sonnet-latest
+          #   Variable OPENCODE_MODEL      — e.g. openrouter/~anthropic/claude-sonnet-latest
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
           OPENCODE_MODEL: ${{ vars.OPENCODE_MODEL }}
-          UPSTREAMER_TIMEOUT_SECONDS: 14400
+          UPSTREAMER_TIMEOUT_SECONDS: 7200
         run: |
           set -euo pipefail
           if [ -z "${OPENROUTER_API_KEY:-}" ]; then
