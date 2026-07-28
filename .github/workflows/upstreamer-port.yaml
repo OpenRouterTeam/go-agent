@@ -29,6 +29,7 @@ on:
 permissions:
   contents: write
   pull-requests: write
+  actions: write # to dispatch ci.yaml onto the generated PR branch
 
 concurrency:
   group: upstreamer-port
@@ -51,6 +52,24 @@ jobs:
       - name: Set up language toolchain
         uses: ./.github/actions/port-toolchain
 
+      # Ports track published releases, not upstream main. When no ref arrives
+      # (cron, or a manual dispatch with the input left blank), resolve the
+      # latest published @openrouter/agent version from the public npm registry
+      # and port its release tag. This makes the cron fully equivalent to the
+      # repository_dispatch fast path — same tag either way — so the pipeline
+      # works with no cross-repo token at all if the dispatch is unavailable.
+      - name: Resolve target ref
+        id: target
+        run: |
+          set -euo pipefail
+          REF="${{ inputs.ref || github.event.client_payload.ref }}"
+          if [ -z "$REF" ]; then
+            VERSION="$(curl -fsSL 'https://registry.npmjs.org/@openrouter%2Fagent/latest' | python3 -c 'import json,sys; print(json.load(sys.stdin)["version"])')"
+            REF="@openrouter/agent@${VERSION}"
+            echo "No ref provided — resolved latest npm release: $REF"
+          fi
+          echo "ref=$REF" >> "$GITHUB_OUTPUT"
+
       - name: Run port
         env:
           # Provide these in repo settings:
@@ -65,10 +84,8 @@ jobs:
             echo "::error::OPENROUTER_API_KEY secret is not set. See .upstreamer/port.env.example."
             exit 1
           fi
-          args=()
+          args=(--ref "${{ steps.target.outputs.ref }}")
           [ "${{ inputs.force }}" = "true" ] && args+=(--force)
-          REF="${{ inputs.ref || github.event.client_payload.ref }}"
-          [ -n "$REF" ] && args+=(--ref "$REF")
           ./scripts/upstream "${args[@]}"
 
       - name: Check for changes
@@ -96,6 +113,7 @@ jobs:
           fi
 
       - name: Open PR
+        id: open-pr
         if: steps.diff.outputs.changed == 'true'
         uses: peter-evans/create-pull-request@v6
         with:
@@ -123,6 +141,17 @@ jobs:
             against the TypeScript reference, not just that it compiles. If
             `.upstreamer/state.yaml` did not advance, the eval did not pass and this
             PR must not be merged as-is.
+
+      # Events created with the native GITHUB_TOKEN deliberately do not trigger
+      # other workflows (GitHub's recursion guard), so the PR opened above gets
+      # no CI checks on its own. workflow_dispatch is exempt from that guard:
+      # kick ci.yaml at the PR branch explicitly. This keeps the whole pipeline
+      # on the native token — no PAT anywhere in this repo.
+      - name: Trigger CI on the port PR
+        if: steps.diff.outputs.changed == 'true' && steps.open-pr.outputs.pull-request-operation != 'none'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh workflow run ci.yaml --repo "$GITHUB_REPOSITORY" --ref upstreamer/sync
 
       - name: Upload logs
         if: always()
