@@ -1,6 +1,9 @@
 # Last upstream commit successfully ported AND verified AND eval-passed.
-# Seeded at @openrouter/agent@0.7.2 (commit adc7939), the release these ports
-# were generated from, so the first run is an incremental 0.7.2 -> 0.8.0 delta
-# rather than a full from-scratch regeneration.
+# 680bceb ports @openrouter/agent 0.7.2 -> 0.8.0: HooksManager lifecycle
+# hooks (upstream #7/#67), versioned ConversationState serialization
+# (#66), PostModelCall telemetry + SessionEnd usage totals, default
+# final-answer directive for AllowFinalResponse (#68), and
+# awaiting_client_tools (#64). Eval verdict: PASS WITH WARNINGS — see
+# .upstreamer/eval-report.md.
 # Only scripts/upstream runs should change this.
-upstream_commit: adc7939f4b7ed85b1a060d13433b8be6063cff73
+upstream_commit: 680bceb4598f228d3e2ec58e2416e4335cdff059

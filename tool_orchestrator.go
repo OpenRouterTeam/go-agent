@@ -1,12 +1,21 @@
 package agent
 
-import "context"
+import (
+	"context"
+	"fmt"
+)
 
 func ExecuteToolLoop(ctx context.Context, tools []Tool, calls []ParsedToolCall, store *ToolContextStore) ([]ToolExecutionResult, error) {
 	results := make([]ToolExecutionResult, 0, len(calls))
 	for _, call := range calls {
 		t := FindToolByName(tools, call.Name)
 		if t == nil {
+			results = append(results, ToolExecutionResult{
+				CallID: call.CallID,
+				Name:   call.Name,
+				Source: ToolSourceClient,
+				Error:  fmt.Errorf("tool %q not found in tool definitions", call.Name),
+			})
 			continue
 		}
 		res, err := ExecuteTool(ctx, t, call, BuildToolExecuteContext(call, TurnContext{}, store, nil))

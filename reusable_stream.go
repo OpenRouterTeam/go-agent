@@ -107,6 +107,15 @@ func (r *ReusableStream[T]) Snapshot() []T {
 
 func (r *ReusableStream[T]) Err() error { r.mu.Lock(); defer r.mu.Unlock(); return r.err }
 
+// IsComplete reports whether the source has been fully read into the
+// buffer. A fresh consumer created after this point replays the retained
+// buffer without waiting on a producer.
+func (r *ReusableStream[T]) IsComplete() bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.done
+}
+
 // enqueue appends a value for delivery to this subscriber.
 func (s *subscriber[T]) enqueue(v T) {
 	s.mu.Lock()

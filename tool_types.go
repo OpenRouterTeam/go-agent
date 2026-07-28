@@ -65,12 +65,26 @@ type ToolPreliminaryResultEvent struct {
 	Event  any    `json:"event"`
 }
 
+// ToolSource discriminates a tool result's origin. "mcp" identifies a tool
+// wrapped from a remote MCP server (see McpBranded/MarkMcp/IsMcpTool);
+// "client" is every locally-defined tool. Mirrors upstream's `source` field
+// added to ToolExecutionResult/ToolResultEvent so a consumer can identify
+// MCP-originated (dynamically typed) results without that collapsing every
+// other tool's result to `unknown`.
+type ToolSource string
+
+const (
+	ToolSourceClient ToolSource = "client"
+	ToolSourceMCP    ToolSource = "mcp"
+)
+
 type ToolResultEvent struct {
-	Type   string `json:"type"`
-	CallID string `json:"call_id"`
-	Name   string `json:"name"`
-	Result any    `json:"result,omitempty"`
-	Error  string `json:"error,omitempty"`
+	Type   string     `json:"type"`
+	CallID string     `json:"call_id"`
+	Name   string     `json:"name"`
+	Source ToolSource `json:"source,omitempty"`
+	Result any        `json:"result,omitempty"`
+	Error  string     `json:"error,omitempty"`
 }
 
 type TurnStartEvent struct {
@@ -94,14 +108,15 @@ type ResponseStreamEvent struct {
 type EnhancedResponseStreamEvent = ResponseStreamEvent
 
 type ToolStreamEvent struct {
-	Type   string `json:"type"`
-	CallID string `json:"call_id,omitempty"`
-	Name   string `json:"name,omitempty"`
-	Event  any    `json:"event,omitempty"`
-	Result any    `json:"result,omitempty"`
-	Output any    `json:"output,omitempty"`
-	Error  string `json:"error,omitempty"`
-	Turn   int    `json:"turn,omitempty"`
+	Type   string     `json:"type"`
+	CallID string     `json:"call_id,omitempty"`
+	Name   string     `json:"name,omitempty"`
+	Source ToolSource `json:"source,omitempty"`
+	Event  any        `json:"event,omitempty"`
+	Result any        `json:"result,omitempty"`
+	Output any        `json:"output,omitempty"`
+	Error  string     `json:"error,omitempty"`
+	Turn   int        `json:"turn,omitempty"`
 }
 
 type ChatStreamEvent = ResponseStreamEvent
@@ -120,6 +135,9 @@ type TypedToolCallUnion = ParsedToolCall
 type ToolExecutionResult struct {
 	CallID string
 	Name   string
+	// Source is "mcp" for a tool marked via MarkMcp, "client" otherwise.
+	// Zero value ("") means the executor path did not set it (treat as client).
+	Source ToolSource
 	Output any
 	Error  error
 	Events []any
@@ -165,14 +183,35 @@ type TurnContext struct {
 type ConversationStatus string
 
 const (
-	ConversationStatusComplete         ConversationStatus = "complete"
-	ConversationStatusInterrupted      ConversationStatus = "interrupted"
+	ConversationStatusComplete    ConversationStatus = "complete"
+	ConversationStatusInterrupted ConversationStatus = "interrupted"
+	// ConversationStatusAwaitingApproval means one or more tool calls need
+	// human approval before executing (see ApproveToolCalls/RejectToolCalls).
 	ConversationStatusAwaitingApproval ConversationStatus = "awaiting_approval"
-	ConversationStatusAwaitingHITL     ConversationStatus = "awaiting_hitl"
-	ConversationStatusInProgress       ConversationStatus = "in_progress"
+	// ConversationStatusAwaitingHITL means a HITL tool returned nil from its
+	// OnToolCalled hook, pausing execution so the caller can supply an output.
+	ConversationStatusAwaitingHITL ConversationStatus = "awaiting_hitl"
+	// ConversationStatusAwaitingClientTools means one or more manual
+	// (execute:false / no OnToolCalled) tool calls are unresolved; the loop
+	// stopped so the caller can execute them client-side and continue.
+	// Distinct from ConversationStatusAwaitingHITL — HITL tools have an
+	// OnToolCalled hook, manual tools do not (upstream #64).
+	ConversationStatusAwaitingClientTools ConversationStatus = "awaiting_client_tools"
+	ConversationStatusInProgress          ConversationStatus = "in_progress"
 )
 
+// ConversationStateVersion is the current supported ConversationState
+// serialization-contract version (upstream #66). Bump this, add a migration
+// branch in DeserializeConversationState, and update the supported-versions
+// list when the wire shape changes.
+const ConversationStateVersion = 1
+
 type ConversationState struct {
+	// Version is the serialization-contract version for this state blob.
+	// Zero (the Go zero value) is treated as version 1 by
+	// DeserializeConversationState/SerializeConversationState, matching
+	// upstream's "absence means v1" legacy-blob policy.
+	Version            int
 	ID                 string
 	Messages           []components.InputsUnion1
 	PreviousResponseID *string
