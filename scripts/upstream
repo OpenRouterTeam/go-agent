@@ -133,8 +133,10 @@ else
 fi
 
 if [ -n "$ref" ]; then
-  if ! target_commit="$(git -C "$upstream_dir" rev-parse --quiet --verify "$ref^{commit}")"; then
-    git -C "$upstream_dir" fetch origin "$ref"
+  # --end-of-options / --: a ref value starting with "-" must not be parsed as
+  # an option (CI refs always start with "@", but manual runs take anything).
+  if ! target_commit="$(git -C "$upstream_dir" rev-parse --quiet --verify --end-of-options "$ref^{commit}")"; then
+    git -C "$upstream_dir" fetch origin -- "$ref"
     target_commit="$(git -C "$upstream_dir" rev-parse FETCH_HEAD^{commit})"
   fi
 else
