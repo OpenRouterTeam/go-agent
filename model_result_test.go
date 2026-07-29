@@ -114,8 +114,11 @@ func TestApprovalResumeReplaysFunctionCallBeforeOutput(t *testing.T) {
 	if len(items) < 2 || (items[0].FunctionCallItem == nil && items[0].OutputFunctionCallItem == nil) || items[1].FunctionCallOutputItem == nil {
 		t.Fatalf("resume input must replay function_call before function_call_output: %#v", items)
 	}
-	if previousID, ok := resumeSender.requests[0].PreviousResponseID.GetOrZero(); !ok || previousID == "" {
-		t.Fatalf("resume request should carry previous_response_id")
+	// previous_response_id must NOT go on the wire: the live Responses API
+	// rejects it on stateless requests ("expected null, received string").
+	// It is tracked in state only, mirroring upstream.
+	if _, ok := resumeSender.requests[0].PreviousResponseID.GetOrZero(); ok {
+		t.Fatalf("resume request must not carry previous_response_id on the wire")
 	}
 }
 

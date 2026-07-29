@@ -33,8 +33,38 @@ jobs:
       - run: go build ./...
       - run: go vet ./...
 
-      # Deterministic tests. e2e_test.go skips without OPENROUTER_API_KEY.
+      # Deterministic tests. e2e_test.go skips without OPENROUTER_API_KEY +
+      # OPENROUTER_AGENT_E2E=1, so this stays free and hermetic.
       - run: go test ./...
+
+  # Live end-to-end tests against the real OpenRouter API: streaming, a real
+  # tool round, approval pause/resume, lifecycle hooks, state serialization
+  # round-trip. Costs a few cents per run (small model, short prompts).
+  #
+  # Warns and exits 0 when the secret is missing (e.g. PRs from forks, where
+  # GitHub withholds secrets) instead of failing — same pattern as upstream
+  # typescript-agent's e2e job.
+  e2e:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.25"
+          cache: true
+
+      - name: Live e2e tests
+        env:
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+          OPENROUTER_AGENT_E2E: "1"
+        run: |
+          if [ -z "$OPENROUTER_API_KEY" ]; then
+            echo "::warning::OPENROUTER_API_KEY is not set; skipping live e2e tests."
+            exit 0
+          fi
+          go test -run 'TestE2E' -v .
 
   # Reports the port's own mechanical gate. Advisory here, BLOCKING inside the
   # sync job (scripts/upstream) where it gates whether state.yaml advances.

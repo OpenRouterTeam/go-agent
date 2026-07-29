@@ -133,9 +133,11 @@ func CallModel(ctx context.Context, client ResponseSender, input CallModelInput)
 	} else if len(state.Messages) > 0 {
 		req.Input = openrouter.Pointer(components.CreateInputsUnionArrayOfInputsUnion1(state.Messages))
 	}
-	if state.PreviousResponseID != nil {
-		req.PreviousResponseID = optionalnullable.From(state.PreviousResponseID)
-	}
+	// PreviousResponseID is tracked in state for observability but never sent
+	// on the wire: this port always sends full message history (mirroring
+	// upstream, which stores previousResponseId in state only), and the live
+	// Responses API rejects previous_response_id on stateless requests
+	// ("expected null, received string").
 	if input.AdditionalInstructions != "" {
 		req.Instructions = optionalnullable.From(openrouter.String(input.AdditionalInstructions))
 	}
@@ -459,7 +461,6 @@ func (m *ModelResult) run() {
 		base = append(base, outputs...)
 		req.Input = openrouter.Pointer(components.CreateInputsUnionArrayOfInputsUnion1(base))
 		if resp.ID != "" {
-			req.PreviousResponseID = optionalnullable.From(openrouter.String(resp.ID))
 			m.state.PreviousResponseID = &resp.ID
 		}
 	}
@@ -648,9 +649,6 @@ func (m *ModelResult) prepareResumeRequest(req *components.ResponsesRequest) (bo
 	m.state.UnsentToolResults = nil
 	m.state.Status = ConversationStatusInProgress
 	req.Input = openrouter.Pointer(components.CreateInputsUnionArrayOfInputsUnion1(items))
-	if m.state.PreviousResponseID != nil {
-		req.PreviousResponseID = optionalnullable.From(m.state.PreviousResponseID)
-	}
 	return false, nil
 }
 
@@ -1383,6 +1381,7 @@ func responseInputItemsWithError(resp components.OpenResponsesResult) ([]compone
 		if err != nil {
 			return nil, fmt.Errorf("marshal response output item: %w", err)
 		}
+		b = flattenMessageContentForUnion(b)
 		var input components.InputsUnion1
 		if err := json.Unmarshal(b, &input); err != nil {
 			return nil, fmt.Errorf("convert response output item to input item: %w", err)
@@ -1390,6 +1389,47 @@ func responseInputItemsWithError(resp components.OpenResponsesResult) ([]compone
 		items = append(items, input)
 	}
 	return items, nil
+}
+
+// flattenMessageContentForUnion rewrites a marshaled `message` item whose
+// content is an array of output_text blocks into the equivalent
+// string-content form. go-sdk v0.5.4's InputsUnion1 unmarshaller panics
+// (reflect on slice value) on array-content assistant messages — the exact
+// shape every live response echoes back on follow-up turns — but accepts the
+// same message with string content. Text is preserved; annotations are not
+// (they are response-side metadata the next request does not need). Remove
+// once the pinned go-sdk's union decoding handles array content.
+func flattenMessageContentForUnion(b []byte) []byte {
+	var raw map[string]any
+	if err := json.Unmarshal(b, &raw); err != nil {
+		return b
+	}
+	if raw["type"] != "message" {
+		return b
+	}
+	blocks, ok := raw["content"].([]any)
+	if !ok {
+		return b
+	}
+	var text strings.Builder
+	for _, block := range blocks {
+		m, ok := block.(map[string]any)
+		if !ok {
+			return b // unknown block shape: leave untouched
+		}
+		if m["type"] != "output_text" {
+			return b // non-text content: leave untouched
+		}
+		if s, ok := m["text"].(string); ok {
+			text.WriteString(s)
+		}
+	}
+	raw["content"] = text.String()
+	flattened, err := json.Marshal(raw)
+	if err != nil {
+		return b
+	}
+	return flattened
 }
 
 func appendResponseItemsToState(state ConversationState, resp components.OpenResponsesResult, items []components.InputsUnion1) ConversationState {
