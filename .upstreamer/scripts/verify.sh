@@ -59,8 +59,11 @@ if command -v go >/dev/null 2>&1; then
 fi
 echo
 
-# Hooks and versioned state are the 0.8.0 parity floor. Named loosely because
-# the Go equivalents may not match TS spelling exactly; the eval checks behavior.
+# Hooks and versioned state are the 0.8.0 parity floor. The 0.8.0 port chose
+# the upstream spelling `HooksManager` verbatim, so this check pins that exact
+# name; the contract's required-API list is the source of truth. If a future
+# port renames it, that is a contract change — update the contract's naming map
+# and this check together, not just the code.
 echo "-- 0.8.0 parity surface present"
 grep -rqE '\bHooksManager\b' --include='*.go' . 2>/dev/null \
   && pass "hooks manager present" \

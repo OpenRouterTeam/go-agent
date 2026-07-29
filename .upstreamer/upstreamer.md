@@ -80,7 +80,9 @@ Stop conditions:
 - `StepCountIs`, `HasToolCall`, `MaxTokensUsed`, `MaxCost`, `FinishReasonIs`
 
 Lifecycle hooks (upstream #7, #67 — the 0.8.0 headline):
-- A `HooksManager` equivalent with options, hook name constants, hook
+- A `HooksManager` type — pinned to the upstream spelling, which is already
+  idiomatic Go (the 0.8.0 port adopted it verbatim; `verify.sh` checks the
+  exact name) — with options, hook name constants, hook
   definition/entry/handler/registry types, tool matchers, `PostModelCall`
   telemetry, `SessionEnd` usage totals
 - Session-id threading per emit so a shared manager is concurrency-safe
