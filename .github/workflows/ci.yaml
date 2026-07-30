@@ -35,7 +35,54 @@ jobs:
 
       # Deterministic tests. e2e_test.go skips without OPENROUTER_API_KEY +
       # OPENROUTER_AGENT_E2E=1, so this stays free and hermetic.
-      - run: go test ./...
+      #
+      # -count=1 defeats Go's test cache: a cached "ok" says the tests passed
+      # for some earlier tree, not this one.
+      # -shuffle=on catches order-dependent tests, which get easier to write
+      # as the suite grows.
+      - name: Tests (shuffled, uncached)
+        run: go test -count=1 -shuffle=on ./...
+
+      # The race detector, blocking. This package's whole job is concurrent
+      # stream fan-out plus a hooks manager documented as concurrency-safe, so a
+      # data race here is a real defect -- and a plain `go test` reports it as a
+      # pass. Slower than the run above, hence separate rather than merged.
+      - name: Race detector
+        run: go test -race -count=1 ./...
+
+      # Coverage ratchet + per-required-symbol coverage. Shares one script with
+      # the port sync so hand-written PRs and generated ports are held to the
+      # same bar; see .upstreamer/scripts/verify.sh for what the two gates mean.
+      - name: Coverage gates
+        run: |
+          go test -count=1 -coverprofile=cover.out ./...
+          total=$(go tool cover -func=cover.out | awk '/^total:/ {gsub("%","",$NF); print $NF}')
+          floor=$(tr -d '[:space:]' < .upstreamer/coverage-floor.txt)
+          echo "coverage ${total}% (floor ${floor}%)"
+          awk -v t="$total" -v f="$floor" 'BEGIN{exit !(t+0 < f+0)}' && {
+            echo "::error::coverage ${total}% is below the floor ${floor}%; add tests rather than lowering the floor"
+            exit 1
+          }
+          awk -v t="$total" -v f="$floor" 'BEGIN{exit !(t+0 >= f+0 + 1.5)}' && {
+            echo "::error::coverage rose to ${total}%; raise the floor in .upstreamer/coverage-floor.txt to lock it in"
+            exit 1
+          }
+          echo "### Coverage \`${total}%\` (floor \`${floor}%\`)" >> "$GITHUB_STEP_SUMMARY"
+
+  # staticcheck catches correctness and concurrency smells `go vet` misses.
+  # Pinned: an unpinned linter turns an upstream release into a surprise red CI
+  # on an unrelated PR.
+  lint:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.25"
+          cache: true
+      - name: staticcheck
+        run: go run honnef.co/go/tools/cmd/staticcheck@2025.1.1 ./...
 
   # Live end-to-end tests against the real OpenRouter API: streaming, a real
   # tool round, approval pause/resume, lifecycle hooks, state serialization
