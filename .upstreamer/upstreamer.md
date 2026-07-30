@@ -201,11 +201,71 @@ File naming follows the existing layout: upstream `lib/tool-executor.ts` →
 navigable against the reference. Do not introduce nested packages without a
 contract change — the flat single-package shape is intentional.
 
+Repo-owned, and never rewritten or deleted by a port run:
+
+```text
+.github/                        # CI and release workflows
+LICENSE
+scripts/upstream                # the sync wrapper
+.upstreamer/                    # except state.yaml, eval-report.md, logs/
+.upstreamer/coverage-floor.txt  # the coverage ratchet
+```
+
+A run that deletes its own gates would otherwise pass verification while
+removing the checks that make the next run trustworthy, so `verify.sh` asserts
+the CI workflow and the coverage floor are still present.
+
+## Test Quality
+
+Binding, not advisory. A port run that ships behavior without the tests below is
+incomplete even if `go build` and `go test` pass.
+
+The failure mode this exists to prevent: a symbol is exported, so the verifier's
+presence check passes; the code compiles, so the build passes; no test ever calls
+it, so nothing detects that it is wrong. `FinishReasonIs` sat in exactly that
+state — in this required-API list, exported, 0% covered.
+
+1. **Port upstream's test cases, not just upstream's code.** Upstream's own tests
+   in `packages/agent/**/*.test.ts` encode the behavior contract most precisely.
+   When a behavior changes, find the upstream case covering it and port that case.
+2. **Assert upstream-observable behavior**, never the port's internal shape:
+   request sequence and ordering, error surfaces, stream event order and turn
+   boundaries, serialized state shape, pause/resume semantics. A test that only
+   pins the port's current structure passes just as happily when the port is
+   wrong, and blocks refactors that are actually correct.
+3. **Cover the edge case, not the happy path.** Upstream fixes are usually edge
+   cases; that edge case *is* the test.
+4. **Every required-API symbol needs a test that exercises it.** Adding a symbol
+   to the Required Public API list and adding its test are one change, not two.
+   `verify.sh` enforces this mechanically.
+5. **Concurrency-touching code needs a test that is meaningful under `-race`.**
+   The race detector is a blocking gate. Shared state in a test must be
+   synchronized: an unsynchronized read/write across goroutines fails `-race`
+   even when the production code is correct.
+6. **Deterministic and hermetic.** No network, no credentials, no wall-clock
+   sleeps for synchronization. Live tests must skip cleanly when credentials are
+   absent — the existing double gate is `OPENROUTER_API_KEY` plus
+   `OPENROUTER_AGENT_E2E=1`.
+7. **Streaming behavior needs a streaming test.** Non-streaming fake responses
+   exercise a fallback path, not the stream. Build events with the SDK's
+   `Create*` constructors so the union's `type` discriminator and member pointer
+   are both set, as they are in real traffic; see the helpers in
+   `stream_fake_test.go`.
+8. **The coverage floor may not be lowered.** `.upstreamer/coverage-floor.txt` is
+   a ratchet. If a run legitimately raises coverage, raise the floor with it. A
+   run that cannot meet the floor is a run that needs more tests, and lowering
+   the floor to go green is the same class of error as hand-editing `state.yaml`.
+
+Prefer extending the existing fakes over inventing new ones — `fakeSender`,
+`twoTurnSender`, `streamingResponse`, `fakeHTTPClient`. Parallel ad-hoc fakes
+fragment the suite and drift apart from production.
+
 ## Verification
 
 `.upstreamer/scripts/verify.sh` must pass: `gofmt` check, `go build ./...`,
-`go vet ./...`, `go test ./...`, plus the required-public-API presence check and
-no-TS-artifact check.
+`go vet ./...`, `go test ./...`, `go test -race ./...`, the coverage ratchet and
+per-required-symbol coverage gates, plus the required-public-API presence check
+and no-TS-artifact check.
 
 Then `.upstreamer/eval.md` must return PASS or PASS WITH WARNINGS from a fresh
 review context before state advances.

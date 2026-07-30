@@ -47,17 +47,26 @@ holds.
 |------|------|
 | `.upstreamer/upstreamer.md` | The rewrite contract. Binding. |
 | `.upstreamer/state.yaml` | Last commit ported *and* verified *and* eval-passed. |
-| `.upstreamer/scripts/verify.sh` | Mechanical gate: build, lint, types, tests, required API. |
+| `.upstreamer/scripts/verify.sh` | Mechanical gate: build, lint, types, tests, race, coverage, required API. |
+| `.upstreamer/coverage-floor.txt` | Coverage ratchet. Raise it, never lower it. |
 | `.upstreamer/eval.md` | Parity gate: fresh-context behavioral review. |
 | `.upstreamer/eval-report.md` | Latest eval result, or a bankruptcy report. |
 | `.upstreamer/skills/upstreamer-converter/` | Execution discipline for the porting agent. |
+| `.upstreamer/skills/porting-tests/` | How to write parity tests for a ported behavior. |
 | `.upstreamer/port.env` | Local secrets. **Gitignored.** |
 | `scripts/upstream` | The wrapper. |
 
 ## Two gates, and why state matters
 
 **Mechanical** (`verify.sh`) — objective: does it build, lint, type-check, pass
-tests, and export every symbol the contract requires.
+tests (including under `-race`), hold the coverage floor, exercise every
+required-API symbol with at least one test, and export every symbol the contract
+requires.
+
+Note what the two coverage gates buy. A presence check cannot see an exported
+symbol that no test ever calls — that is how `FinishReasonIs` sat at 0% coverage
+while passing verification. The per-symbol gate closes that hole; the ratchet
+stops coverage from eroding one sync at a time.
 
 **Parity** (`eval.md`) — judgment, run in a fresh context that reads the upstream
 reference directly: does it actually *behave* like upstream. This is the gate that
@@ -113,5 +122,10 @@ Review it as a *port*, not a normal diff:
 2. Read the upstream delta yourself for anything load-bearing — the tool loop,
    state serialization, approval/HITL ordering, hooks, streaming.
 3. Confirm new tests assert *upstream behavior*, not merely the port's own shape.
+   Read the upstream test file for the changed behavior and check the port covers
+   the same cases. Ignore test counts — Go subtests bundle cases, so the ratio to
+   upstream's `it` blocks is meaningless.
 4. Any new naming mapping the run derived should be promoted into the contract's
    naming table.
+5. Check the coverage floor moved up, or stayed put — never down. A lowered floor
+   is the same class of error as hand-editing `state.yaml`.
