@@ -1,5 +1,17 @@
 # go-agent Changelog
 
+## Unreleased
+
+- Fixed a possible nil-pointer dereference in the `AllowFinalResponse` test path
+  and lower-cased the `stop hook: …` wrapped error string to follow Go
+  conventions (it was `Stop hook: …`). If you match on that error's text rather
+  than using `errors.Is`/`errors.As`, update the comparison.
+- No behavior changes to the public API. The rest of this release is test and CI
+  hardening: the race detector, a coverage ratchet, and per-required-symbol
+  coverage are now enforced gates, and `ToolEventBroadcaster` plus the
+  `stream_guards.go` predicates are now used by the streaming loop instead of
+  sitting alongside duplicate inline logic.
+
 ## Lifecycle Hooks, Versioned State, And 0.8.0 Parity (ported from `@openrouter/agent@0.8.0`)
 
 - Added `HooksManager` (`NewHooksManager`), a typed lifecycle-hook system with the nine built-in hooks — `PreToolUse`, `PostToolUse`, `PostToolUseFailure`, `UserPromptSubmit`, `Stop`, `PermissionRequest`, `SessionStart`, `SessionEnd`, and `PostModelCall` — plus fully custom hooks via the generic `On`/`Emit` functions. Register built-ins with the typed `OnXxx`/`EmitXxx` methods (`manager.OnPreToolUse(...)`, etc.).

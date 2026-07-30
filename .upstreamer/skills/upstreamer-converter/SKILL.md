@@ -78,13 +78,21 @@ substrate-pin section directs it.
 
 ## Step 4: Tests
 
-Ported behavior without a test proves nothing. For every behavioral change:
+Ported behavior without a test proves nothing. **Read the `porting-tests` skill
+and follow it** — it carries the mechanics: which upstream test file to port
+from, which existing fakes to reuse, and the anti-patterns that produce tests
+which pass while the port is wrong.
+
+The contract's Test Quality section is binding; the short version:
 
 1. Add or update deterministic tests in this repo's existing test layout and style.
 2. Cover the specific upstream behavior that changed, not just the happy path.
    Upstream fixes are usually edge cases — that edge case is the test.
-3. Tests must pass without network access or paid credentials. Live/e2e tests
-   must skip cleanly when credentials are absent.
+3. Port upstream's own test case for the behavior rather than inventing one.
+4. Assert upstream-observable behavior, never the port's internal shape.
+5. Tests must pass without network access or paid credentials, and under
+   `-race`. Live/e2e tests must skip cleanly when credentials are absent.
+6. Never lower `.upstreamer/coverage-floor.txt` to make a run go green.
 
 ## Step 5: Mechanical verification
 

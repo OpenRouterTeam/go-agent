@@ -72,6 +72,31 @@ even on no-tools stream error paths.
 **Compatibility helpers.** Claude/Chat conversion round-trips preserve metadata,
 reasoning, tool use, and unsupported content.
 
+**Test parity.** You have the upstream tree; the mechanical verifier does not, so
+this comparison is yours to make and it is the one gate that can catch an
+untested behavior change.
+
+```bash
+ls tmp/upstreamer/upstream/packages/agent/tests/unit/
+git -C tmp/upstreamer/upstream diff --stat <last>..<target> -- '*.test.ts'
+```
+
+For every behavior that changed in the delta, find upstream's test for it and
+confirm this repo covers the same case. Report upstream cases with no Go
+counterpart, and treat a changed behavior with no test as a finding — the port
+compiled and passed its own suite, which is exactly the state a version-behind
+port is in.
+
+Do **not** grade on test counts. Upstream has ~46 test files and ~619 `it` blocks
+against this repo's ~70 `Test` funcs, but Go table-driven subtests bundle many
+cases into one function, so the ratio means nothing. Compare *cases covered*,
+per behavior.
+
+Also check the tests assert upstream-observable behavior — ordering, error
+surfaces, stream boundaries, state shape — rather than the port's internal shape.
+A test that merely pins current structure passes just as happily when the port is
+wrong.
+
 **Divergences are the documented ones.** Every difference from upstream is either
 in the contract's Idiomatic Divergences section or recorded as a compatibility
 note. An undocumented divergence is a finding.
@@ -85,8 +110,9 @@ Return `PASS`, `PASS WITH WARNINGS`, or `FAIL` with concrete findings — file,
 symbol, and what specifically differs from upstream.
 
 - `FAIL` — a required API symbol is missing, a behavioral parity gap exists in the
-  load-bearing loop / state / approval ordering / hooks, or the declared version
-  overstates what was ported.
+  load-bearing loop / state / approval ordering / hooks, the declared version
+  overstates what was ported, or a behavior that changed in this delta landed
+  with no test covering it.
 - `PASS WITH WARNINGS` — parity holds on behavior; gaps are cosmetic, type-level,
   or already documented as divergences.
 - `PASS` — no findings.

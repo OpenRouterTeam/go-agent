@@ -145,6 +145,82 @@ func TestClaudeRoundTripEveryRoleAndCarrier(t *testing.T) {
 	}
 }
 
+// TestToChatMessageCarriesTextToolCallsAndMetadata covers ToChatMessage, which
+// is in the contract's required public API but had no test: it was exported (so
+// the verifier's presence check passed) while nothing asserted its output.
+//
+// Unlike ToClaudeMessage it is a direct value conversion with no error, so the
+// contract is simply that text, tool calls, and metadata all survive.
+func TestToChatMessageCarriesTextToolCallsAndMetadata(t *testing.T) {
+	call := components.OutputFunctionCallItem{CallID: "c1", Name: "search", Arguments: `{"query":"go"}`}
+	resp := components.OpenResponsesResult{
+		ID:         "resp_1",
+		Model:      "openai/test",
+		Status:     components.OpenAIResponsesResponseStatusCompleted,
+		OutputText: openrouter.String("here you go"),
+		Output:     []components.OutputItems{components.CreateOutputItemsFunctionCall(call)},
+	}
+
+	msg := ToChatMessage(resp)
+
+	if msg.Role != "assistant" {
+		t.Fatalf("Role = %q, want assistant", msg.Role)
+	}
+	if msg.Content != "here you go" {
+		t.Fatalf("Content = %v, want %q", msg.Content, "here you go")
+	}
+	if len(msg.ToolCalls) != 1 {
+		t.Fatalf("expected 1 tool call, got %d", len(msg.ToolCalls))
+	}
+	if msg.ToolCalls[0].CallID != "c1" || msg.ToolCalls[0].Name != "search" {
+		t.Fatalf("tool call not carried: %+v", msg.ToolCalls[0])
+	}
+	// Arguments is `any` at the JSON boundary; decoded object args land as a map.
+	args, ok := msg.ToolCalls[0].Arguments.(map[string]any)
+	if !ok {
+		t.Fatalf("tool call arguments = %T, want map[string]any", msg.ToolCalls[0].Arguments)
+	}
+	if args["query"] != "go" {
+		t.Fatalf("tool call arguments not decoded: %+v", args)
+	}
+	if msg.Metadata["id"] != "resp_1" {
+		t.Fatalf("metadata id = %v, want resp_1", msg.Metadata["id"])
+	}
+	if msg.Metadata["model"] != "openai/test" {
+		t.Fatalf("metadata model = %v, want openai/test", msg.Metadata["model"])
+	}
+	if msg.Metadata["status"] != string(components.OpenAIResponsesResponseStatusCompleted) {
+		t.Fatalf("metadata status = %v", msg.Metadata["status"])
+	}
+}
+
+// TestToChatMessageFeedsBackThroughFromChatMessages asserts the pair composes:
+// a converted assistant message must survive FromChatMessages, which is how a
+// caller replays chat history into a follow-up request.
+func TestToChatMessageFeedsBackThroughFromChatMessages(t *testing.T) {
+	call := components.OutputFunctionCallItem{CallID: "c1", Name: "search", Arguments: `{"query":"go"}`}
+	resp := components.OpenResponsesResult{
+		ID:         "resp_1",
+		OutputText: openrouter.String("calling"),
+		Output:     []components.OutputItems{components.CreateOutputItemsFunctionCall(call)},
+	}
+
+	items, err := FromChatMessages([]ChatMessage{ToChatMessage(resp)})
+	if err != nil {
+		t.Fatalf("FromChatMessages: %v", err)
+	}
+
+	var sawToolCall bool
+	for _, it := range items {
+		if it.FunctionCallItem != nil && it.FunctionCallItem.CallID == "c1" {
+			sawToolCall = true
+		}
+	}
+	if !sawToolCall {
+		t.Fatalf("tool call lost in ToChatMessage -> FromChatMessages round trip: %#v", items)
+	}
+}
+
 // TestChatRoundTripEveryRole asserts FromChatMessages handles every chat role
 // and that tool messages become function_call_output items. Run-2 16c (Chat).
 func TestChatRoundTripEveryRole(t *testing.T) {

@@ -55,7 +55,7 @@ type ModelResult struct {
 	err                 error
 	textStream          *ReusableStream[string]
 	reasoningStream     *ReusableStream[string]
-	toolStream          *ReusableStream[ToolStreamEvent]
+	toolStream          *ToolEventBroadcaster
 	toolCallStream      *ReusableStream[ParsedToolCall]
 	fullStream          *ReusableStream[ResponseStreamEvent]
 	newMessages         *ReusableStream[components.InputsUnion1]
@@ -69,7 +69,7 @@ type ModelResult struct {
 
 func newModelResult(ctx context.Context, client ResponseSender, input CallModelInput, req components.ResponsesRequest, state ConversationState) *ModelResult {
 	ctx2, cancel := context.WithCancel(ctx)
-	return &ModelResult{ctx: ctx2, cancel: cancel, client: client, input: input, req: req, state: state, store: NewToolContextStore(input.Context), done: make(chan struct{}), textStream: NewReusableStream[string](), reasoningStream: NewReusableStream[string](), toolStream: NewReusableStream[ToolStreamEvent](), toolCallStream: NewReusableStream[ParsedToolCall](), fullStream: NewReusableStream[ResponseStreamEvent](), newMessages: NewReusableStream[components.InputsUnion1](), hooksManager: ResolveHooks(input.Hooks)}
+	return &ModelResult{ctx: ctx2, cancel: cancel, client: client, input: input, req: req, state: state, store: NewToolContextStore(input.Context), done: make(chan struct{}), textStream: NewReusableStream[string](), reasoningStream: NewReusableStream[string](), toolStream: NewToolEventBroadcaster(), toolCallStream: NewReusableStream[ParsedToolCall](), fullStream: NewReusableStream[ResponseStreamEvent](), newMessages: NewReusableStream[components.InputsUnion1](), hooksManager: ResolveHooks(input.Hooks)}
 }
 
 func NewModelResultFromResponse(resp components.OpenResponsesResult) *ModelResult {
@@ -83,7 +83,7 @@ func NewModelResultFromResponse(resp components.OpenResponsesResult) *ModelResul
 	}
 	mr.textStream.Complete(nil)
 	mr.reasoningStream.Complete(nil)
-	mr.toolStream.Complete(nil)
+	mr.toolStream.Complete()
 	mr.toolCallStream.Complete(nil)
 	mr.fullStream.Push(ResponseStreamEvent{Type: "turn.start", Turn: 0})
 	mr.fullStream.Push(ResponseStreamEvent{Type: "response.completed", Response: &resp})
@@ -190,7 +190,9 @@ func (m *ModelResult) run() {
 	defer func() {
 		m.textStream.Complete(m.err)
 		m.reasoningStream.Complete(m.err)
-		m.toolStream.Complete(m.err)
+		// Error(nil) is the broadcaster's no-error completion, so this is
+		// equivalent to the sibling Complete(m.err) calls for both outcomes.
+		m.toolStream.Error(m.err)
 		m.toolCallStream.Complete(m.err)
 		m.fullStream.Complete(m.err)
 		m.newMessages.Complete(m.err)
@@ -274,14 +276,11 @@ func (m *ModelResult) run() {
 			return
 		}
 		resp, events, err := consumeCreateResponse(res, func(ev components.StreamEvents) {
-			if ev.TextDeltaEvent != nil {
-				m.textStream.Push(ev.TextDeltaEvent.Delta)
+			if delta, ok := textDeltaText(ev); ok {
+				m.textStream.Push(delta)
 			}
-			if ev.ReasoningDeltaEvent != nil {
-				m.reasoningStream.Push(ev.ReasoningDeltaEvent.Delta)
-			}
-			if ev.ReasoningSummaryTextDeltaEvent != nil {
-				m.reasoningStream.Push(ev.ReasoningSummaryTextDeltaEvent.Delta)
+			if delta, ok := reasoningDeltaText(ev); ok {
+				m.reasoningStream.Push(delta)
 			}
 			m.fullStream.Push(ResponseStreamEvent{Type: "response.event", Turn: turn, Event: &ev})
 		})
@@ -899,8 +898,8 @@ func (m *ModelResult) retryCurrentRequest(req components.ResponsesRequest, turn 
 		return components.OpenResponsesResult{}, err
 	}
 	retryResp, events, err := consumeCreateResponse(res, func(ev components.StreamEvents) {
-		if ev.TextDeltaEvent != nil {
-			m.textStream.Push(ev.TextDeltaEvent.Delta)
+		if delta, ok := textDeltaText(ev); ok {
+			m.textStream.Push(delta)
 		}
 		m.fullStream.Push(ResponseStreamEvent{Type: "response.event", Turn: turn, Event: &ev})
 	})
@@ -1063,7 +1062,7 @@ func (m *ModelResult) runStopHook(req *components.ResponsesRequest, forceResumeC
 
 	stopResult, err := m.hooksManager.EmitStop(StopPayload{Reason: StopReasonMaxTurns}, m.hookEmitOptions(""))
 	if err != nil {
-		return false, fmt.Errorf("Stop hook: %w", err)
+		return false, fmt.Errorf("stop hook: %w", err)
 	}
 
 	shouldForceResume := false
@@ -1312,7 +1311,9 @@ func (m *ModelResult) ReasoningStream(ctx context.Context) (<-chan string, func(
 }
 func (m *ModelResult) ToolStream(ctx context.Context) (<-chan ToolStreamEvent, func() error) {
 	m.start()
-	return m.toolStream.Subscribe(32)
+	// The broadcaster already applies the same buffer size its sibling streams
+	// pass explicitly.
+	return m.toolStream.Subscribe()
 }
 func (m *ModelResult) ToolCallsStream(ctx context.Context) (<-chan ParsedToolCall, func() error) {
 	m.start()
