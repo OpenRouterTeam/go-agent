@@ -161,8 +161,11 @@ func TestAllowFinalResponseSendsNoToolsRequestOnStop(t *testing.T) {
 	}
 	// bare `true` appends the default final-answer directive (upstream #68).
 	directive := items[3].EasyInputMessage
+	if directive == nil {
+		t.Fatalf("expected default final-answer directive to be appended, got %#v", items[3])
+	}
 	content, ok := directive.Content.GetOrZero()
-	if directive == nil || !ok || content.Str == nil || *content.Str != DefaultFinalResponseDirective {
+	if !ok || content.Str == nil || *content.Str != DefaultFinalResponseDirective {
 		t.Fatalf("expected default final-answer directive to be appended, got %#v", items[3])
 	}
 }

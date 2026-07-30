@@ -1062,7 +1062,7 @@ func (m *ModelResult) runStopHook(req *components.ResponsesRequest, forceResumeC
 
 	stopResult, err := m.hooksManager.EmitStop(StopPayload{Reason: StopReasonMaxTurns}, m.hookEmitOptions(""))
 	if err != nil {
-		return false, fmt.Errorf("Stop hook: %w", err)
+		return false, fmt.Errorf("stop hook: %w", err)
 	}
 
 	shouldForceResume := false
