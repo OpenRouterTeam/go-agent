@@ -2,6 +2,7 @@ package agent
 
 import (
 	"errors"
+	"sync"
 	"testing"
 	"time"
 )
@@ -207,12 +208,25 @@ func TestHooksManagerSessionIDThreading(t *testing.T) {
 func TestHooksManagerAsyncDrain(t *testing.T) {
 	m := NewHooksManager()
 	work := make(chan error)
-	var handlerCompleted bool
+	// handlerCompleted is written by the detached goroutine below and read by
+	// this test goroutine, so it needs a mutex — without one this test races
+	// and `go test -race` fails. The assertions are about ordering (emit
+	// returns before the work settles; Drain waits for it), which the lock
+	// preserves.
+	var mu sync.Mutex
+	handlerCompleted := false
+	completed := func() bool {
+		mu.Lock()
+		defer mu.Unlock()
+		return handlerCompleted
+	}
 	m.OnPostToolUse(HookEntry[PostToolUsePayload, EmptyHookResult]{
 		Handler: func(payload PostToolUsePayload, hctx LifecycleHookContext) (HookHandlerResult[EmptyHookResult], error) {
 			go func() {
 				time.Sleep(10 * time.Millisecond)
+				mu.Lock()
 				handlerCompleted = true
+				mu.Unlock()
 				close(work)
 			}()
 			return AsyncResult[EmptyHookResult](AsyncOutput{Work: work}), nil
@@ -223,11 +237,11 @@ func TestHooksManagerAsyncDrain(t *testing.T) {
 		t.Fatal(err)
 	}
 	// Async handler must not block emit from returning.
-	if handlerCompleted {
+	if completed() {
 		t.Fatalf("async handler should not have completed synchronously")
 	}
 	m.Drain()
-	if !handlerCompleted {
+	if !completed() {
 		t.Fatalf("Drain should wait for detached async work to settle")
 	}
 }
