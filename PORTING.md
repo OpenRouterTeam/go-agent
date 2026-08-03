@@ -9,27 +9,58 @@ listed in the Idiomatic Divergences section of `.upstreamer/upstreamer.md`.
 
 ## How it works
 
+The port tracks upstream's **default-branch HEAD**, not the latest published npm
+release.
+
 ```
-typescript-agent publishes @openrouter/agent to npm
-        │
-        │  repository_dispatch: openrouter-agent-published
+   weekly cron  ·  publish dispatch  ·  manual dispatch
+        │              (a nudge,          (optional
+        │               not a ref)         explicit ref)
         ▼
 .github/workflows/upstreamer-port.yaml
-        │
+        │  resolve ref: explicit input, else upstream HEAD
         ▼
 scripts/upstream
         │  1. fetch upstream, resolve target commit
-        │  2. compare against .upstreamer/state.yaml — skip if unchanged
-        │  3. opencode runs the port against .upstreamer/upstreamer.md
-        │  4. .upstreamer/scripts/verify.sh   (mechanical gate)
-        │  5. .upstreamer/eval.md            (parity gate, fresh context)
-        │  6. advance state.yaml — ONLY if both gates pass
+        │  2. REFUSE if target is behind state.yaml (would revert work)
+        │  3. compare against .upstreamer/state.yaml — skip if unchanged
+        │  4. opencode runs the port against .upstreamer/upstreamer.md
+        │  5. .upstreamer/scripts/verify.sh   (mechanical gate)
+        │  6. .upstreamer/eval.md            (parity gate, fresh context)
+        │  7. advance state.yaml — ONLY if both gates pass
         ▼
-    Pull request  (never a direct push to main)
+    Pull request, opened by the GitHub App so it gets real
+    pull_request-event CI checks  (never a direct push to main)
 ```
 
-A weekly cron backs up the dispatch in case one is missed, and
-`workflow_dispatch` allows a manual run against any ref.
+### Why HEAD and not the latest release
+
+Release tracking sounds more conservative and is worse in practice. Upstream can
+sit for weeks with large unreleased work on `main` — doom-loop detection (#73) was
+~7,500 lines, ~4,700 of it tests, and rewrote a big part of `model-result.ts`. A
+release-tracking port stays blind to that, then absorbs the entire delta in one
+automated run touching the most load-bearing module in the package. Tracking HEAD
+keeps each delta small enough that a human can actually review it.
+
+Two consequences follow, and both are handled rather than ignored:
+
+**The port is routinely ahead of the latest release.** So a release ref is now
+*dangerous*: it resolves to an ancestor of what is already ported, and the
+converter would faithfully "port" the older tree, reverting landed work.
+`scripts/upstream` refuses a target that is behind `state.yaml` (exit 3) unless
+`--force` is given, and the workflow ignores the publish dispatch's
+`client_payload.ref` for the same reason.
+
+**A release tag cut from that tree would misrepresent it.** A Go module declares no
+version, so there is no version field to drift — but the ported tree can sit ahead
+of the release tag matching its surface, and `git tag v0.8.0` there would ship
+unreleased upstream behavior under a released number. Module tags are immutable in
+the proxy's cache, so the verifier reports how many commits ahead the tree is
+before a tag gets cut. Tag from a commit level with a release tag.
+
+The weekly cron is the primary trigger. The publish dispatch still fires on a new
+npm release — useful as "something shipped, sync promptly" — but it syncs to HEAD
+like everything else. `workflow_dispatch` allows a manual run against any ref.
 
 ## The contract is the product
 
@@ -106,6 +137,48 @@ Two values, same names locally and in CI:
 |------|-------|------|
 | `OPENROUTER_API_KEY` | local: `.upstreamer/port.env` · CI: repo **secret** | `sk-or-…` key opencode uses for inference |
 | `OPENCODE_MODEL` | local: `.upstreamer/port.env` · CI: repo **variable** | e.g. `openrouter/~anthropic/claude-opus-latest` |
+
+Two more are needed in CI only, for the bot that opens port PRs:
+
+| Name | Kind | What |
+|------|------|------|
+| `PORT_BOT_APP_ID` | repo **variable** | The GitHub App's App ID |
+| `PORT_BOT_PRIVATE_KEY` | repo **secret** | The App's generated private key (full PEM, including the BEGIN/END lines) |
+
+### Why the port PR needs a GitHub App
+
+GitHub does not trigger workflows from events created with the native
+`GITHUB_TOKEN` (its recursion guard), so a PR opened with that token gets no
+`pull_request`-event checks at all.
+
+Measured on python-agent PR #24, which runs this same pipeline: the commit carried
+**14 check-runs while the PR's rollup showed 7** — a `workflow_dispatch` run of the
+same workflow on the same commit was completely invisible to the PR. That is why
+"just dispatch `ci.yaml` at the branch" does not substitute for it; the run exists
+but gates nothing.
+
+`main` is not branch-protected on this repo, so unlike python-agent nothing
+mechanically blocks a merge — which makes this *more* important here, not less.
+An automated port PR with no attached checks, sitting next to a green dispatched
+run, is exactly the thing a reviewer merges on the assumption CI covered it.
+
+An App installation token is not recursion-guarded, so the PR it opens gets real
+checks. Preferred over a PAT: scoped to this repo, not tied to anyone's personal
+account, and revocable on its own.
+
+**Setup** — create a GitHub App (org Settings → Developer settings → GitHub Apps):
+
+- Repository permissions: **Contents: Read and write**, **Pull requests: Read and
+  write**. Nothing else.
+- Install it on `OpenRouterTeam/go-agent`.
+- Generate a private key, then add `PORT_BOT_APP_ID` (variable) and
+  `PORT_BOT_PRIVATE_KEY` (secret).
+
+Until both exist the pipeline still runs and still opens a PR, but emits a
+`::warning::` saying the PR will receive no checks. That is deliberate — an
+unconfigured bot should degrade loudly, not look healthy. Both halves are required
+by the gate: the ID alone would make the mint step run and fail on the missing
+key, breaking a pipeline that otherwise works.
 
 The wrapper writes the key into `~/.local/share/opencode/auth.json` so headless
 runs work without the interactive `opencode /connect` flow.

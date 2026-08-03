@@ -113,13 +113,16 @@ jobs:
           fi
           go test -run 'TestE2E' -v .
 
-  # Reports the port's own mechanical gate. Advisory here, BLOCKING inside the
-  # sync job (scripts/upstream) where it gates whether state.yaml advances.
+  # The port's own mechanical gate, blocking in both places it runs: here on every
+  # PR, and inside the sync job (scripts/upstream) where it decides whether
+  # state.yaml advances.
   #
-  # Advisory on purpose: the port is currently a minor version behind upstream, so
-  # the required-API check fails by design until the first sync lands. Making that
-  # a red required check on every unrelated PR just teaches people to ignore CI.
-  # The signal still shows up in the job summary.
+  # It was advisory while the port sat a minor version behind upstream and the
+  # required-API check failed by design. That gap closed with the 0.8.0 port and
+  # the verifier now passes clean, so continue-on-error only bought the ability to
+  # regress the parity floor with a green PR. The upstream-dependent sections
+  # (release-tag position, test-cluster parity) SKIP without an upstream checkout
+  # rather than fail, so a plain actions/checkout is enough to run this.
   verify-port:
     runs-on: ubuntu-latest
     timeout-minutes: 15
@@ -127,9 +130,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: ./.github/actions/port-toolchain
-      - name: Port verifier (advisory)
+      - name: Port verifier
         id: verify
-        continue-on-error: true
         run: |
           set -o pipefail
           ./.upstreamer/scripts/verify.sh 2>&1 | tee /tmp/verify.log
@@ -143,8 +145,8 @@ jobs:
             if [ "${{ steps.verify.outcome }}" = "success" ]; then
               echo "Port is in sync with its parity floor."
             else
-              echo "Parity gaps below. Expected until the port catches up to upstream —"
-              echo "advisory here, blocking inside the sync job."
+              echo "Parity floor violated — see the failures below. This blocks the PR:"
+              echo "fix the gap rather than lowering the gate."
             fi
             echo
             echo '```'

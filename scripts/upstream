@@ -149,6 +149,35 @@ echo "target:    $target_commit${ref:+ ($ref)}" >&2
 echo "last port: ${last_upstream_commit:-none}" >&2
 echo "model:     ${model:-<opencode default>}" >&2
 
+# Refuse to port backwards.
+#
+# The port tracks upstream's default branch, so it is routinely AHEAD of the
+# latest published release. That makes a release ref actively dangerous: a
+# publish dispatch (or a manual --ref v0.8.0) resolves to a commit that is an
+# ancestor of what we already ported, and the converter would dutifully "port"
+# the older tree — silently reverting everything landed since.
+#
+# Ancestor of last-ported, and not equal to it, means strictly behind. Unrelated
+# histories (no merge-base) are not caught here; they surface as a normal diff
+# for review rather than a silent revert.
+if [ "$force" -eq 0 ] && [ -n "$last_upstream_commit" ] && [ "$target_commit" != "$last_upstream_commit" ] \
+   && git -C "$upstream_dir" merge-base --is-ancestor "$target_commit" "$last_upstream_commit" 2>/dev/null; then
+  behind_by="$(git -C "$upstream_dir" rev-list --count "$target_commit..$last_upstream_commit" 2>/dev/null || echo "?")"
+  cat >&2 <<MSG
+ERROR: refusing to port backwards.
+
+  target:      $target_commit${ref:+ ($ref)}
+  last ported: $last_upstream_commit
+  target is $behind_by commit(s) BEHIND what is already ported.
+
+This repo tracks upstream's default branch, so it is normally ahead of the latest
+release tag. Porting an older ref would revert work already landed and eval-passed.
+
+If you genuinely intend to move the port back to this ref, re-run with --force.
+MSG
+  exit 3
+fi
+
 if [ "$force" -eq 0 ] && [ "$target_commit" = "$last_upstream_commit" ]; then
   {
     echo "Run summary"
