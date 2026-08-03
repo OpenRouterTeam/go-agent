@@ -148,6 +148,92 @@ grep -rq 'service_tier\|ServiceTier' --include='*.go' . 2>/dev/null \
   || fail "service_tier=auto workaround missing (breaks real request serialization)"
 echo
 
+# A Go module declares no version, so there is no downstream version field to
+# drift against upstream's package.json — the drift check the Python port needs
+# has no analogue here and is deliberately absent.
+#
+# What still applies is position relative to the release tag. This port tracks
+# upstream HEAD, so it routinely contains work upstream has not released, and
+# `git tag v0.8.0` on that tree would publish post-0.8.0 behavior under a
+# released number. Consumers pin go-agent by tag, and a pushed tag is immutable
+# in the module proxy's cache, so this has to be visible before tagging rather
+# than discovered after. Not a failure: being ahead is the intended state.
+echo "-- Release-tag position"
+upstream_git="tmp/upstreamer/upstream"
+upstream_pkg="$upstream_git/packages/agent/package.json"
+if [ -d "$upstream_git/.git" ] && [ -f "$upstream_pkg" ]; then
+  target=$(grep -m1 '"version"' "$upstream_pkg" | sed 's/.*"version": *"\([^"]*\)".*/\1/')
+  ported_sha="$(git -C "$upstream_git" rev-parse HEAD 2>/dev/null || true)"
+  rel_tag="$(git -C "$upstream_git" tag -l "@openrouter/agent@$target" | head -1)"
+  if [ -n "$ported_sha" ] && [ -n "$rel_tag" ]; then
+    ahead="$(git -C "$upstream_git" rev-list --count "$rel_tag^{commit}..$ported_sha" 2>/dev/null || echo 0)"
+    if [ "${ahead:-0}" -gt 0 ]; then
+      echo "  NOTE: ported tree is $ahead commit(s) ahead of the $target release tag."
+      echo "        Correct for a HEAD-tracking port, but do NOT cut a v$target tag"
+      echo "        from this state — it would ship unreleased upstream work under a"
+      echo "        released version number, and module tags cannot be recalled."
+      echo "        Tag only from a commit level with a release tag, or after"
+      echo "        upstream releases."
+    else
+      pass "ported tree is level with the $target release tag (taggable)"
+    fi
+  else
+    echo "  SKIP: no @openrouter/agent@$target tag in the upstream checkout"
+  fi
+else
+  # Only present during a sync run. Standalone/CI invocations legitimately have no
+  # upstream checkout; not a failure, but say so rather than passing silently.
+  echo "  SKIP: no upstream checkout — release-tag position unchecked"
+fi
+echo
+
+# The suite is what makes "a version behind on real behavior" visible or
+# invisible, so upstream's test surface is mechanically compared. Advisory:
+# which gaps are acceptable is a judgment call, and .upstreamer/eval.md makes it.
+#
+# Compared at FEATURE-CLUSTER granularity, not file-for-file. The Python port can
+# map 1:1 because pytest keeps upstream's file split; this port does not, and
+# should not — Go consolidates by type under test, so `hooks-matchers.test.ts`
+# lands as TestHooksManagerToolMatcherFailsClosed in hooks_manager_test.go and
+# `run-cancellation.test.ts` as TestResultCancelStopsRunWithoutPanic. A per-file
+# check was measured against this tree and reported 35-40 of 44 files "missing"
+# while nearly all were in fact ported under Go names: noise that loud trains
+# people to skip the section. Clustering on the leading path token and searching
+# the whole test corpus reports only clusters with no coverage at all, which is
+# the signal worth acting on.
+echo "-- Test parity with upstream (advisory)"
+upstream_tests="tmp/upstreamer/upstream/packages/agent/tests/unit"
+if [ -d "$upstream_tests" ]; then
+  # Test function names plus bodies plus filenames: a cluster counts as covered
+  # if it is mentioned anywhere in the Go suite, not only in a function name.
+  corpus=$(mktemp)
+  { cat ./*_test.go 2>/dev/null; ls ./*_test.go 2>/dev/null | tr -d '_'; } \
+    | tr 'A-Z' 'a-z' > "$corpus"
+  absent=""
+  # .test-d.ts files are compile-time type assertions with no runtime analogue in
+  # Go's type system; excluded rather than reported as perpetual gaps.
+  clusters=$(ls "$upstream_tests" | grep '\.test\.ts$' | sed 's/\.test\.ts$//' \
+    | awk -F- '{print $1}' | sort -u)
+  for c in $clusters; do
+    grep -q "$c" "$corpus" || absent="$absent $c"
+  done
+  rm -f "$corpus"
+  if [ -z "${absent// /}" ]; then
+    pass "every upstream test cluster is represented in the Go suite"
+  else
+    count=$(printf '%s' "$absent" | wc -w | tr -d ' ')
+    echo "  NOTE: $count upstream test cluster(s) with no mention anywhere in the Go suite:"
+    for name in $absent; do
+      echo "        ${name}-*.test.ts — no Go test references '${name}'"
+    done
+    echo "        Not a mechanical failure — see the Test Quality section of"
+    echo "        .upstreamer/upstreamer.md and let the eval judge severity."
+  fi
+else
+  echo "  SKIP: no upstream checkout — test parity unchecked"
+fi
+echo
+
 echo "-- No leaked TypeScript artifacts"
 leaked=$(find . -path ./tmp -prune -o -type f \( -name '*.ts' -o -name '*.js' \
   -o -name 'package.json' -o -name 'tsconfig*.json' -o -name 'pnpm-lock.yaml' \) -print 2>/dev/null)

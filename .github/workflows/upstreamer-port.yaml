@@ -1,10 +1,28 @@
 name: Upstreamer Port
 
-# Ports @openrouter/agent into this repo. Two triggers:
-#   1. repository_dispatch from typescript-agent's publish.yaml on a new npm release
-#      (event type: openrouter-agent-published) — the intended path. Ports track
-#      published releases, not every commit to upstream main.
-#   2. Weekly cron as a safety net for missed dispatches, plus manual dispatch.
+# Ports @openrouter/agent into this repo.
+#
+# The port tracks upstream's **default-branch HEAD**, not the latest published npm
+# release. Release tracking sounds safer but produces exactly the failure this
+# pipeline exists to prevent: upstream can sit for weeks with large unreleased
+# work on main (doom-loop detection, #73, was ~7.5k lines) and the port stays
+# blind to it, then absorbs the whole delta in one automated run touching the most
+# load-bearing modules. Tracking HEAD keeps each delta small enough to review.
+#
+# Consequence to keep in mind: the port is then routinely AHEAD of the latest
+# release, so the release tag matching its ported surface legitimately lags
+# upstream's package.json. The verifier reports that rather than failing — Go
+# modules carry no version field, so there is nothing to drift, but tagging a
+# release from an ahead-of-tag tree would still misrepresent it.
+#
+# Three triggers, all resolving to HEAD unless given an explicit ref:
+#   1. Weekly cron — the primary path now that releases are not the trigger.
+#   2. repository_dispatch from typescript-agent's publish.yaml on a new npm
+#      release. Still useful as a "something just shipped, sync promptly" nudge,
+#      but it no longer pins the ref to that release tag: doing so would port
+#      BACKWARDS once the port is ahead of the release. scripts/upstream refuses
+#      an ancestor ref outright.
+#   3. Manual dispatch, optionally with an explicit ref.
 #
 # Opens a PR. Never pushes to main. A failed parity eval leaves
 # .upstreamer/state.yaml unchanged, so the next run retries the same delta.
@@ -39,6 +57,13 @@ jobs:
   port:
     runs-on: ubuntu-latest
     timeout-minutes: 150
+    env:
+      # Surfaced as env because the `secrets` context is NOT available in a
+      # step-level `if:` (only github/needs/strategy/matrix/job/runner/env/vars/
+      # steps/inputs are). Referencing secrets.* there evaluates to empty and the
+      # condition silently never matches — so the App-token gate below tests this
+      # variable instead. Only ever compared against '' ; never echoed.
+      HAS_APP_KEY: ${{ secrets.PORT_BOT_PRIVATE_KEY != '' }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -52,21 +77,29 @@ jobs:
       - name: Set up language toolchain
         uses: ./.github/actions/port-toolchain
 
-      # Ports track published releases, not upstream main. When no ref arrives
-      # (cron, or a manual dispatch with the input left blank), resolve the
-      # latest published @openrouter/agent version from the public npm registry
-      # and port its release tag. This makes the cron fully equivalent to the
-      # repository_dispatch fast path — same tag either way — so the pipeline
-      # works with no cross-repo token at all if the dispatch is unavailable.
+      # Blank ref = upstream default-branch HEAD, which scripts/upstream resolves
+      # itself. That is the normal case for both the cron and a publish dispatch.
+      #
+      # Only an EXPLICIT manual `ref` input is honored. The publish dispatch's
+      # client_payload.ref is deliberately ignored: it carries the release tag,
+      # which is an ancestor of HEAD once the port is ahead of the release, so
+      # honoring it would revert landed work. The dispatch still does its real
+      # job — waking the pipeline promptly after a release — it just syncs to HEAD
+      # like every other trigger. (scripts/upstream also refuses an ancestor ref
+      # outright, so this is defense in depth, not the only guard.)
       - name: Resolve target ref
         id: target
         run: |
           set -euo pipefail
-          REF="${{ inputs.ref || github.event.client_payload.ref }}"
-          if [ -z "$REF" ]; then
-            VERSION="$(curl -fsSL 'https://registry.npmjs.org/@openrouter%2Fagent/latest' | python3 -c 'import json,sys; print(json.load(sys.stdin)["version"])')"
-            REF="@openrouter/agent@${VERSION}"
-            echo "No ref provided — resolved latest npm release: $REF"
+          REF="${{ inputs.ref }}"
+          if [ -n "$REF" ]; then
+            echo "Explicit ref requested: $REF"
+          else
+            PAYLOAD_REF="${{ github.event.client_payload.ref }}"
+            if [ -n "$PAYLOAD_REF" ]; then
+              echo "::notice::Ignoring dispatch payload ref '$PAYLOAD_REF' — this port tracks upstream HEAD, and a release tag is an ancestor once the port is ahead of it. Syncing to HEAD instead."
+            fi
+            echo "No explicit ref — porting upstream default-branch HEAD."
           fi
           echo "ref=$REF" >> "$GITHUB_OUTPUT"
 
@@ -84,9 +117,14 @@ jobs:
             echo "::error::OPENROUTER_API_KEY secret is not set. See .upstreamer/port.env.example."
             exit 1
           fi
-          args=(--ref "${{ steps.target.outputs.ref }}")
+          # Only pass --ref when there is actually a ref. `--ref ""` is not the
+          # same as omitting it: the arg parser consumes the empty value and the
+          # script would target an empty ref instead of defaulting to HEAD.
+          args=()
+          REF="${{ steps.target.outputs.ref }}"
+          [ -n "$REF" ] && args+=(--ref "$REF")
           [ "${{ inputs.force }}" = "true" ] && args+=(--force)
-          ./scripts/upstream "${args[@]}"
+          ./scripts/upstream ${args[@]+"${args[@]}"}
 
       - name: Check for changes
         id: diff
@@ -112,12 +150,52 @@ jobs:
             echo "passed=true" >> "$GITHUB_OUTPUT"
           fi
 
+      # Mint a GitHub App installation token so the PR is created by the App
+      # rather than by the native GITHUB_TOKEN.
+      #
+      # Why this exists: GitHub does not trigger workflows from events created
+      # with GITHUB_TOKEN (recursion guard), so a PR opened with it gets no
+      # pull_request-event checks. Measured on python-agent PR #24, which runs the
+      # same pipeline: the commit had 14 check-runs while the PR's rollup showed
+      # 7 — the workflow_dispatch half was invisible to the PR. So the "dispatch
+      # ci.yaml explicitly" fallback below produces a green run that is not
+      # attached to the PR, which is materially worse here than on python-agent:
+      # main is not branch-protected on this repo, so nothing stops a reviewer
+      # from merging an automated port PR whose checks appear absent or, worse,
+      # reading a dispatched green run as if it had gated this diff.
+      #
+      # An App installation token is not recursion-guarded, so the PR gets real
+      # pull_request checks. Preferred over a PAT: scoped to this repo, not tied to
+      # a person's account, and independently revocable.
+      #
+      # Optional by design — see the fallback below.
+      - name: Mint App token
+        id: app-token
+        # Gate on BOTH halves. Gating on the App ID alone is a trap: the ID is a
+        # variable and the key is a secret, so they are added in separate places
+        # and one routinely lands first (that is the state right now — the ID is
+        # set on this repo, the key is not). With only the ID set, this step would
+        # run and fail on the missing key, turning a working fallback into a
+        # broken pipeline — worse than no App at all.
+        if: >-
+          steps.diff.outputs.changed == 'true'
+          && vars.PORT_BOT_APP_ID != ''
+          && env.HAS_APP_KEY == 'true'
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ vars.PORT_BOT_APP_ID }}
+          private-key: ${{ secrets.PORT_BOT_PRIVATE_KEY }}
+
       - name: Open PR
         id: open-pr
         if: steps.diff.outputs.changed == 'true'
         uses: peter-evans/create-pull-request@v6
         with:
-          token: ${{ secrets.GITHUB_TOKEN }}
+          # App token when configured; GITHUB_TOKEN otherwise. With the fallback
+          # the PR still opens, but its checks will not attach — the guard step
+          # below says so loudly rather than leaving a PR that looks unchecked
+          # (or falsely checked) with no explanation.
+          token: ${{ steps.app-token.outputs.token || secrets.GITHUB_TOKEN }}
           branch: upstreamer/sync
           delete-branch: true
           title: >-
@@ -142,16 +220,23 @@ jobs:
             `.upstreamer/state.yaml` did not advance, the eval did not pass and this
             PR must not be merged as-is.
 
-      # Events created with the native GITHUB_TOKEN deliberately do not trigger
-      # other workflows (GitHub's recursion guard), so the PR opened above gets
-      # no CI checks on its own. workflow_dispatch is exempt from that guard:
-      # kick ci.yaml at the PR branch explicitly. This keeps the whole pipeline
-      # on the native token — no PAT anywhere in this repo.
-      - name: Trigger CI on the port PR
-        if: steps.diff.outputs.changed == 'true' && steps.open-pr.outputs.pull-request-operation != 'none'
+      # Fallback path only. With the App configured, the PR above already has real
+      # pull_request checks and nothing here runs.
+      #
+      # Without it, the dispatched run below does NOT attach to the PR. It gives a
+      # human something to read, but it is not a check on that diff — and since
+      # main here is unprotected, an unattached green run is easy to mistake for
+      # one. Say that plainly rather than letting the PR look gated.
+      - name: Trigger CI on the port PR (no App token — checks will not attach)
+        if: >-
+          steps.diff.outputs.changed == 'true'
+          && steps.open-pr.outputs.pull-request-operation != 'none'
+          && steps.app-token.outputs.token == ''
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: gh workflow run ci.yaml --repo "$GITHUB_REPOSITORY" --ref upstreamer/sync
+        run: |
+          echo "::warning::PORT_BOT_APP_ID / PORT_BOT_PRIVATE_KEY are not configured, so this PR was opened with GITHUB_TOKEN and will receive NO pull_request-event checks. The dispatched run below is informational only and does not gate this diff — do not read it as a passing check. Configure the App (see PORTING.md) or close and reopen the PR by hand to generate real checks."
+          gh workflow run ci.yaml --repo "$GITHUB_REPOSITORY" --ref upstreamer/sync
 
       - name: Upload logs
         if: always()
