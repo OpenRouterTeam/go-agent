@@ -6,12 +6,16 @@ import (
 	"context"
 	"io"
 	"net/http"
+	"runtime/debug"
+	"strings"
 	"time"
 
 	openrouter "github.com/OpenRouterTeam/go-sdk"
 	"github.com/OpenRouterTeam/go-sdk/models/components"
 	"github.com/OpenRouterTeam/go-sdk/models/operations"
 )
+
+const agentModulePath = "github.com/OpenRouterTeam/go-agent"
 
 // ResponseSender is the narrow Responses API surface used by CallModel.
 type ResponseSender interface {
@@ -61,10 +65,11 @@ func NewOpenRouter(opts OpenRouterOptions) *OpenRouter {
 		base = http.DefaultClient
 	}
 	mwClient := &middlewareClient{
-		base:     base,
-		before:   append(append([]RequestMiddleware{}, opts.BeforeRequest...), opts.RequestHooks...),
-		after:    append([]ResponseMiddleware{}, opts.AfterResponse...),
-		afterErr: append([]ErrorMiddleware{}, opts.AfterError...),
+		base:       base,
+		agentToken: agentUserAgentToken(),
+		before:     append(append([]RequestMiddleware{}, opts.BeforeRequest...), opts.RequestHooks...),
+		after:      append([]ResponseMiddleware{}, opts.AfterResponse...),
+		afterErr:   append([]ErrorMiddleware{}, opts.AfterError...),
 	}
 
 	sdkOpts := []openrouter.SDKOption{openrouter.WithClient(mwClient)}
@@ -105,13 +110,22 @@ func (s SDKClient) SendResponse(ctx context.Context, request components.Response
 }
 
 type middlewareClient struct {
-	base     openrouter.HTTPClient
-	before   []RequestMiddleware
-	after    []ResponseMiddleware
-	afterErr []ErrorMiddleware
+	base       openrouter.HTTPClient
+	agentToken string
+	before     []RequestMiddleware
+	after      []ResponseMiddleware
+	afterErr   []ErrorMiddleware
 }
 
 func (m *middlewareClient) Do(req *http.Request) (*http.Response, error) {
+	if req.Header == nil {
+		req.Header = make(http.Header)
+	}
+	agentToken := m.agentToken
+	if agentToken == "" {
+		agentToken = agentUserAgentToken()
+	}
+	req.Header.Set("User-Agent", appendAgentUserAgent(req.Header.Get("User-Agent"), agentToken))
 	ctx := req.Context()
 	for _, hook := range m.before {
 		if err := hook(ctx, req); err != nil {
@@ -133,6 +147,44 @@ func (m *middlewareClient) Do(req *http.Request) (*http.Response, error) {
 		}
 	}
 	return res, nil
+}
+
+func agentUserAgentToken() string {
+	buildInfo, ok := debug.ReadBuildInfo()
+	if !ok {
+		return agentModulePath
+	}
+	return agentUserAgentTokenFromBuildInfo(buildInfo)
+}
+
+func agentUserAgentTokenFromBuildInfo(buildInfo *debug.BuildInfo) string {
+	if buildInfo == nil {
+		return agentModulePath
+	}
+	modules := append([]*debug.Module{&buildInfo.Main}, buildInfo.Deps...)
+	for _, module := range modules {
+		if module == nil || module.Path != agentModulePath {
+			continue
+		}
+		version := strings.TrimPrefix(module.Version, "v")
+		if version == "" || version == "(devel)" {
+			return agentModulePath
+		}
+		return agentModulePath + "/" + version
+	}
+	return agentModulePath
+}
+
+func appendAgentUserAgent(userAgent string, agentToken string) string {
+	for _, token := range strings.Fields(userAgent) {
+		if token == agentToken {
+			return userAgent
+		}
+	}
+	if userAgent == "" {
+		return agentToken
+	}
+	return userAgent + " " + agentToken
 }
 
 func cloneResponseForHook(res *http.Response) *http.Response {
