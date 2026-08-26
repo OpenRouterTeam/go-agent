@@ -183,6 +183,11 @@ Deliberate and permanent. Do not converge these toward TypeScript.
    parity wins.
 6. **Channels for streams.** Fan-out uses the reusable-stream helper; a stream
    error must reach every consumer.
+7. **User-agent wrapper identity is language-specific.** Go appends the module
+   path (`github.com/OpenRouterTeam/go-agent`), while TypeScript appends the npm
+   package name (`@openrouter/agent`) and Python appends the PyPI distribution
+   name (`openrouter-agent-sdk`). Porting must not convert this token to the
+   TypeScript literal.
 
 ## Output Shape
 
