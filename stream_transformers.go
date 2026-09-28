@@ -32,7 +32,50 @@ func ExtractTextFromResponse(resp components.OpenResponsesResult) string {
 	return b.String()
 }
 
+// isTruncatedAtMaxOutputTokens reports whether the provider stopped resp at
+// max_output_tokens. The function_call items on such a response are an
+// unfinished batch: the model asked for the set together, and the last one
+// carries whatever argument prefix fit in the budget. Executing the complete
+// ones would hand the model a result set with a silent hole and spend side
+// effects on a turn that truncates the same way on the same budget, so none of
+// them run (upstream #125). The caller sees every output item and
+// IncompleteDetails, and resumes once the budget is raised.
+func isTruncatedAtMaxOutputTokens(resp components.OpenResponsesResult) bool {
+	return resp.Status == components.OpenAIResponsesResponseStatusIncomplete &&
+		resp.IncompleteDetails != nil && resp.IncompleteDetails.Reason != nil &&
+		*resp.IncompleteDetails.Reason == components.ReasonMaxOutputTokens
+}
+
+// ResponseHasToolCalls reports whether resp contains any tool calls the loop
+// should execute. A response truncated at max_output_tokens has none, even
+// when its output carries a cut-off function_call item.
+func ResponseHasToolCalls(resp components.OpenResponsesResult) bool {
+	if isTruncatedAtMaxOutputTokens(resp) {
+		return false
+	}
+	for _, item := range resp.Output {
+		if item.OutputFunctionCallItem != nil {
+			return true
+		}
+	}
+	return false
+}
+
+// ExtractToolCallsFromResponse extracts the executable tool calls from a
+// completed response. A response truncated at max_output_tokens yields no
+// tool calls (see isTruncatedAtMaxOutputTokens).
 func ExtractToolCallsFromResponse(resp components.OpenResponsesResult) []ParsedToolCall {
+	if isTruncatedAtMaxOutputTokens(resp) {
+		return nil
+	}
+	return extractEmittedToolCalls(resp)
+}
+
+// extractEmittedToolCalls returns every parseable function_call the model
+// emitted, truncated turn included. It backs the ToolCallsStream consumer
+// view, which upstream reports before (and regardless of) the truncation
+// verdict, while execution uses ExtractToolCallsFromResponse.
+func extractEmittedToolCalls(resp components.OpenResponsesResult) []ParsedToolCall {
 	var calls []ParsedToolCall
 	for _, item := range resp.Output {
 		if item.OutputFunctionCallItem == nil {

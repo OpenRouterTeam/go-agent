@@ -127,6 +127,17 @@ type ParsedToolCall struct {
 	Name      string
 	Arguments any
 	RawArgs   string
+	// PreToolUseApplied is an additive marker recorded on a pending call
+	// when the PreToolUse hook already ran for it and Arguments are its
+	// effective (post-hook) arguments (upstream #94). A resumed run executes
+	// such a call without applying the hook a second time; legacy state
+	// without the marker keeps its prior behavior (the hook runs on resume).
+	PreToolUseApplied bool `json:",omitempty"`
+
+	// preparedBlockReason carries an in-flight PreToolUse/second-gate block
+	// verdict for this call occurrence between gating and execution. Never
+	// serialized; blocked calls are never persisted as pending.
+	preparedBlockReason string
 }
 
 type TypedToolCall = ParsedToolCall
@@ -140,6 +151,9 @@ type ToolExecutionResult struct {
 	Source ToolSource
 	Output any
 	Error  error
+	// Events is kept for source compatibility and is no longer populated:
+	// generator yields are broadcast live (ToolStream "tool.preliminary")
+	// but not accumulated per call (upstream #110).
 	Events []any
 }
 
@@ -222,6 +236,13 @@ type ConversationState struct {
 	Status             ConversationStatus
 	CreatedAt          int64
 	UpdatedAt          int64
+	// ConsumedForcedToolChoiceKey is the canonical key of a caller-forced
+	// tool choice (required, a specific tool, or allowed_tools mode
+	// required) that already produced a tool call in this logical run, so
+	// follow-up turns — including the first request after an approval, HITL,
+	// or client-tool resume — relax it to auto (upstream #100, DEV-785).
+	// Additive within version 1; cleared when the run completes.
+	ConsumedForcedToolChoiceKey string `json:",omitempty"`
 }
 
 type StateAccessor interface {

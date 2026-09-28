@@ -27,11 +27,32 @@ type ToolConfig[In any] struct {
 	Approval           ToolApprovalCheck
 	OnToolCalled       func(context.Context, In, ToolExecuteContext) (any, bool, error)
 	OnResponseReceived func(context.Context, any, ToolExecuteContext) (any, error)
+	// WireInputSchema is a caller-owned JSON Schema serialized as the tool's
+	// wire `parameters` instead of the schema generated from In (or
+	// InputSchema). Manual tools only (upstream #118): NewTool rejects it on
+	// an executable tool. It is deep-copied and tilde-prefixed keys are
+	// sanitized, so the caller's map is never mutated.
+	WireInputSchema map[string]any
+	// NextTurnParams computes request parameters for the turn after this
+	// tool runs (see NextTurnParamsFunctions), e.g. widening an
+	// allowed_tools toolChoice once a tool-search tool found what the model
+	// needs.
+	NextTurnParams NextTurnParamsFunctions
+	// Strict sets the function tool's `strict` flag on the wire, letting a
+	// provider enforce structured-outputs-style schema adherence on tool-call
+	// arguments (upstream #99). nil serializes as `strict: null` (provider
+	// default), matching upstream's `strict ?? null`.
+	Strict *bool
 }
 
+// ErrWireInputSchemaNotManual is returned by NewTool when WireInputSchema is
+// set on a tool that is not manual (upstream types it `never` there).
+var ErrWireInputSchemaNotManual = errors.New("WireInputSchema is only supported on manual tools")
+
 type TypedTool[In any] struct {
-	config ToolConfig[In]
-	schema map[string]any
+	config     ToolConfig[In]
+	schema     map[string]any
+	wireSchema map[string]any
 }
 
 func NewTool[In any](config ToolConfig[In]) (*TypedTool[In], error) {
@@ -52,6 +73,12 @@ func NewTool[In any](config ToolConfig[In]) (*TypedTool[In], error) {
 		t.schema = schema
 	}
 	t.schema = SanitizeSchema(t.schema)
+	if config.WireInputSchema != nil {
+		if t.ToolType() != ToolTypeManual {
+			return nil, ErrWireInputSchemaNotManual
+		}
+		t.wireSchema = SanitizeSchema(config.WireInputSchema)
+	}
 	return t, nil
 }
 
@@ -69,6 +96,9 @@ func (t *TypedTool[In]) InputSchema() map[string]any  { return copyMap(t.schema)
 func (t *TypedTool[In]) OutputSchema() map[string]any { return copyMap(t.config.OutputSchema) }
 func (t *TypedTool[In]) EventSchema() map[string]any  { return copyMap(t.config.EventSchema) }
 
+// NextTurnParams returns the tool's next-turn parameter functions.
+func (t *TypedTool[In]) NextTurnParams() NextTurnParamsFunctions { return t.config.NextTurnParams }
+
 func (t *TypedTool[In]) ToolType() ToolType {
 	switch {
 	case t.config.OnToolCalled != nil:
@@ -82,11 +112,78 @@ func (t *TypedTool[In]) ToolType() ToolType {
 	}
 }
 
+// RequiresApproval evaluates the tool-level approval gate. A predicate
+// (Approval) receives the call with Arguments normalized through the same
+// decode Execute uses — validated against the input schema and decoded into
+// In, then re-encoded — so it decides on exactly the values Execute will
+// receive (upstream #94). If the arguments fail validation or decoding there
+// is no trustworthy value to judge, so the gate fails closed (true): a
+// PreToolUse hook may later repair the input, and schema-invalid wire
+// arguments must not bypass approval.
 func (t *TypedTool[In]) RequiresApproval(ctx context.Context, call ParsedToolCall, turn TurnContext) (bool, error) {
 	if t.config.Approval != nil {
+		normalized, ok := t.normalizeArguments(call)
+		if !ok {
+			return true, nil
+		}
+		call.Arguments = normalized
 		return t.config.Approval(ctx, call, turn)
 	}
 	return t.config.RequireApproval, nil
+}
+
+// normalizeArguments decodes call's arguments exactly the way Execute does
+// (schema validation, then json.Unmarshal into In) and re-encodes the typed
+// value to its JSON-object form. ok is false when the arguments are invalid
+// or the normalized value is not a JSON object.
+func (t *TypedTool[In]) normalizeArguments(call ParsedToolCall) (any, bool) {
+	raw, err := rawToolArguments(call)
+	if err != nil {
+		return nil, false
+	}
+	if err := ValidateAgainstSchema(raw, t.schema); err != nil {
+		return nil, false
+	}
+	var input In
+	if err := json.Unmarshal(raw, &input); err != nil {
+		return nil, false
+	}
+	b, err := json.Marshal(input)
+	if err != nil {
+		return nil, false
+	}
+	var out map[string]any
+	if err := json.Unmarshal(b, &out); err != nil {
+		return nil, false
+	}
+	return out, true
+}
+
+// hasApprovalPredicate reports whether the tool-level approval gate is a
+// predicate (as opposed to a static bool), which is what makes a
+// PreToolUse-mutated input need a second approval check.
+func (t *TypedTool[In]) hasApprovalPredicate() bool { return t.config.Approval != nil }
+
+// approvalPredicateTool is implemented by tools whose approval gate may be a
+// per-call predicate.
+type approvalPredicateTool interface{ hasApprovalPredicate() bool }
+
+// argumentNormalizer is implemented by tools that can normalize call
+// arguments the way their Execute path will see them.
+type argumentNormalizer interface {
+	normalizeArguments(ParsedToolCall) (any, bool)
+}
+
+// rawToolArguments returns the JSON arguments ExecuteTool would hand to
+// Execute for call.
+func rawToolArguments(call ParsedToolCall) (json.RawMessage, error) {
+	if call.RawArgs != "" {
+		return json.RawMessage(call.RawArgs), nil
+	}
+	if call.Arguments != nil {
+		return json.Marshal(call.Arguments)
+	}
+	return json.RawMessage("{}"), nil
 }
 
 func (t *TypedTool[In]) HandleResponseReceived(ctx context.Context, output any, execCtx ToolExecuteContext) (any, error) {
@@ -97,16 +194,24 @@ func (t *TypedTool[In]) HandleResponseReceived(ctx context.Context, output any, 
 }
 
 func (t *TypedTool[In]) ToAPITool() components.ResponsesRequestToolUnion {
+	params := t.InputSchema()
+	if t.wireSchema != nil {
+		params = copyMap(t.wireSchema)
+	}
 	fn := components.ResponsesRequestToolFunction{
 		Name:       t.config.Name,
-		Parameters: t.InputSchema(),
+		Parameters: params,
 		Type:       components.ResponsesRequestTypeFunction,
 	}
 	if t.config.Description != "" {
 		fn.Description = optionalnullable.From(openrouter.String(t.config.Description))
 	}
-	strict := true
-	fn.Strict = optionalnullable.From(&strict)
+	var strict *bool
+	if t.config.Strict != nil {
+		v := *t.config.Strict
+		strict = &v
+	}
+	fn.Strict = optionalnullable.From(strict)
 	return components.CreateResponsesRequestToolUnionFunction(fn)
 }
 
@@ -135,24 +240,25 @@ func (t *TypedTool[In]) Execute(ctx context.Context, raw json.RawMessage, execCt
 		return ToolExecutionResult{CallID: execCtx.ToolCall.CallID, Name: t.config.Name, Output: out}, nil
 	}
 	if t.config.Generate != nil {
-		var events []any
+		// Yields are broadcast live via Emit but no longer accumulated onto
+		// the result (upstream #110): a long-running generator must not
+		// retain its full yield history.
 		out, err := t.config.Generate(ctx, input, execCtx, func(v any) error {
 			if err := validateAny(v, t.config.EventSchema); err != nil {
 				return err
 			}
-			events = append(events, v)
 			if execCtx.Emit != nil {
 				execCtx.Emit(v)
 			}
 			return nil
 		})
 		if err != nil {
-			return ToolExecutionResult{CallID: execCtx.ToolCall.CallID, Name: t.config.Name, Events: events, Error: err}, nil
+			return ToolExecutionResult{CallID: execCtx.ToolCall.CallID, Name: t.config.Name, Error: err}, nil
 		}
 		if err := t.validateOutput(out); err != nil {
-			return ToolExecutionResult{CallID: execCtx.ToolCall.CallID, Name: t.config.Name, Output: out, Events: events, Error: err}, nil
+			return ToolExecutionResult{CallID: execCtx.ToolCall.CallID, Name: t.config.Name, Output: out, Error: err}, nil
 		}
-		return ToolExecutionResult{CallID: execCtx.ToolCall.CallID, Name: t.config.Name, Output: out, Events: events}, nil
+		return ToolExecutionResult{CallID: execCtx.ToolCall.CallID, Name: t.config.Name, Output: out}, nil
 	}
 	if t.config.Execute == nil {
 		return ToolExecutionResult{CallID: execCtx.ToolCall.CallID, Name: t.config.Name, Error: ErrManualTool}, nil
@@ -264,6 +370,25 @@ func (b mcpBrand) Execute(ctx context.Context, raw json.RawMessage, execCtx Tool
 		return ToolExecutionResult{CallID: execCtx.ToolCall.CallID, Name: b.Tool.ToolName(), Error: ErrManualTool}, nil
 	}
 	return exec.Execute(ctx, raw, execCtx)
+}
+
+func (b mcpBrand) normalizeArguments(call ParsedToolCall) (any, bool) {
+	if n, ok := b.Tool.(argumentNormalizer); ok {
+		return n.normalizeArguments(call)
+	}
+	return nil, false
+}
+
+func (b mcpBrand) hasApprovalPredicate() bool {
+	p, ok := b.Tool.(approvalPredicateTool)
+	return ok && p.hasApprovalPredicate()
+}
+
+func (b mcpBrand) NextTurnParams() NextTurnParamsFunctions {
+	if nt, ok := b.Tool.(nextTurnParamsTool); ok {
+		return nt.NextTurnParams()
+	}
+	return nil
 }
 
 // mcpMarked is implemented only by mcpBrand; IsMcpTool structurally checks

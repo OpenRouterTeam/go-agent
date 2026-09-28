@@ -170,6 +170,14 @@ func ToolRequiresApproval(ctx context.Context, t Tool, call ParsedToolCall, turn
 		return false, nil
 	}
 	if callLevel != nil {
+		// Call-level checks always take precedence and run unconditionally.
+		// Pass a normalized copy (the values Execute will receive) when the
+		// arguments parse, or the raw call when they do not (upstream #94).
+		if n, ok := t.(argumentNormalizer); ok {
+			if normalized, ok := n.normalizeArguments(call); ok {
+				call.Arguments = normalized
+			}
+		}
 		return callLevel(ctx, call, turn)
 	}
 	return t.RequiresApproval(ctx, call, turn)

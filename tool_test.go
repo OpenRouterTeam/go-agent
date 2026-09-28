@@ -55,8 +55,13 @@ func TestToolExecutionValidationAndGeneratorEvents(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(result.Events) != 1 || len(live) != 1 {
-		t.Fatalf("generator events should be emitted live and recorded")
+	// Upstream #110 (DEV-817): yields are broadcast live but no longer
+	// accumulated onto the terminal result.
+	if len(live) != 1 {
+		t.Fatalf("generator events should be emitted live, got %d", len(live))
+	}
+	if len(result.Events) != 0 {
+		t.Fatalf("generator yields must not be accumulated on the result, got %d", len(result.Events))
 	}
 	if !IsGeneratorTool(generator) || !IsRegularExecuteTool(regular) || IsManualTool(regular) {
 		t.Fatalf("tool guards misclassified tools")

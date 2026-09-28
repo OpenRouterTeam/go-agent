@@ -65,11 +65,21 @@ type ModelResult struct {
 	sessionEndEmitted   bool
 	sessionUsage        sessionUsageAggregate
 	toolRoundsExecuted  int
+	// Forced tool-choice relaxation (upstream #100). configuredToolChoice is
+	// the caller's policy (updated by a NextTurnParams ToolChoice), and
+	// consumedToolChoiceKey the forced key that already produced a tool call.
+	configuredToolChoice  *components.OpenAIResponsesToolChoiceUnion
+	consumedToolChoiceKey string
+	pendingToolChoiceKey  *string
+	// roundCalls/roundResults are the calls executed by the latest
+	// executeToolCallsForTurn, consumed by NextTurnParams.
+	roundCalls   []ParsedToolCall
+	roundResults []ToolExecutionResult
 }
 
 func newModelResult(ctx context.Context, client ResponseSender, input CallModelInput, req components.ResponsesRequest, state ConversationState) *ModelResult {
 	ctx2, cancel := context.WithCancel(ctx)
-	return &ModelResult{ctx: ctx2, cancel: cancel, client: client, input: input, req: req, state: state, store: NewToolContextStore(input.Context), done: make(chan struct{}), textStream: NewReusableStream[string](), reasoningStream: NewReusableStream[string](), toolStream: NewToolEventBroadcaster(), toolCallStream: NewReusableStream[ParsedToolCall](), fullStream: NewReusableStream[ResponseStreamEvent](), newMessages: NewReusableStream[components.InputsUnion1](), hooksManager: ResolveHooks(input.Hooks)}
+	return &ModelResult{ctx: ctx2, cancel: cancel, client: client, input: input, req: req, state: state, store: NewToolContextStore(input.Context), done: make(chan struct{}), textStream: NewReusableStream[string](), reasoningStream: NewReusableStream[string](), toolStream: NewToolEventBroadcaster(), toolCallStream: NewReusableStream[ParsedToolCall](), fullStream: NewReusableStream[ResponseStreamEvent](), newMessages: NewReusableStream[components.InputsUnion1](), hooksManager: ResolveHooks(input.Hooks), configuredToolChoice: req.ToolChoice, consumedToolChoiceKey: state.ConsumedForcedToolChoiceKey}
 }
 
 func NewModelResultFromResponse(resp components.OpenResponsesResult) *ModelResult {
@@ -151,10 +161,30 @@ func CallModel(ctx context.Context, client ResponseSender, input CallModelInput)
 		tier := components.ResponsesRequestServiceTierAuto
 		req.ServiceTier = optionalnullable.From(&tier)
 	}
+	input.Tools = filterActiveTools(input.Tools, input.ActiveTools)
 	for _, t := range input.Tools {
 		req.Tools = append(req.Tools, t.ToAPITool())
 	}
 	return newModelResult(ctx, client, input, req, state), nil
+}
+
+// filterActiveTools narrows tools to the active subset (server tools always
+// pass). A nil active list means all tools are active.
+func filterActiveTools(tools []Tool, active []string) []Tool {
+	if active == nil {
+		return tools
+	}
+	set := make(map[string]struct{}, len(active))
+	for _, name := range active {
+		set[name] = struct{}{}
+	}
+	var out []Tool
+	for _, t := range tools {
+		if _, ok := set[t.ToolName()]; ok || IsServerTool(t) {
+			out = append(out, t)
+		}
+	}
+	return out
 }
 
 func inputItemsOnly(input any) ([]components.InputsUnion1, error) {
@@ -246,6 +276,7 @@ func (m *ModelResult) run() {
 			// calls pending. Without this, a StateAccessor-backed caller
 			// that reloads on the next CallModel call would see the stale
 			// pre-resume state and could re-execute an already-decided call.
+			m.syncToolChoiceState()
 			if m.input.StateAccessor != nil {
 				if err := m.input.StateAccessor.Save(m.ctx, m.state); err != nil {
 					m.err = err
@@ -269,6 +300,7 @@ func (m *ModelResult) run() {
 			}
 		}
 		m.fullStream.Push(ResponseStreamEvent{Type: "turn.start", Turn: turn})
+		m.applyForcedToolChoicePolicy(&req)
 		turnStartedAt := time.Now()
 		res, err := m.client.SendResponse(m.ctx, req, m.input.MetadataLevel, operations.WithSetHeaders(map[string]string{"x-openrouter-callmodel": "true"}))
 		if err != nil {
@@ -297,14 +329,19 @@ func (m *ModelResult) run() {
 			}
 		}
 		m.emitPostModelCall(resp, turnStartedAt, turnType, turn+1)
+		m.commitToolChoiceDispatch(ResponseHasToolCalls(resp))
 		text := ExtractTextFromResponse(resp)
 		if len(events) == 0 && text != "" {
 			m.textStream.Push(text)
 		}
 		m.fullStream.Push(ResponseStreamEvent{Type: "response.completed", Turn: turn, Response: &resp})
 		m.fullStream.Push(ResponseStreamEvent{Type: "turn.end", Turn: turn})
+		// Execution uses the truncation-guarded extraction (a response cut
+		// off at max_output_tokens executes nothing, upstream #125), while
+		// ToolCallsStream stays a consumer view of every emitted call,
+		// truncated one included, matching upstream's getToolCallsStream.
 		calls := ExtractToolCallsFromResponse(resp)
-		for _, call := range calls {
+		for _, call := range extractEmittedToolCalls(resp) {
 			m.toolCallStream.Push(call)
 		}
 		usage := usagePtr(resp)
@@ -356,31 +393,24 @@ func (m *ModelResult) run() {
 					m.state.Status = ConversationStatusComplete
 					break
 				}
-				approved, pending, err := PartitionToolCalls(m.ctx, m.input.Tools, calls, BuildTurnContext(nil, turn, &req), m.input.Approval)
+				// The forced-final path runs the same approval gate as the
+				// in-loop call sites (upstream #94): gated calls pause the
+				// run instead of executing unguarded.
+				approved, stillPending, deniedOutputs, err := m.gateToolCalls(calls, turn, &req)
 				if err != nil {
 					m.err = err
 					return
 				}
-				var deniedOutputs []components.InputsUnion1
-				if len(pending) > 0 {
-					gateApproved, stillPending, gateDenied, gateErr := m.applyPermissionRequestGate(pending)
-					if gateErr != nil {
-						m.err = gateErr
+				if len(stillPending) > 0 {
+					unsent, err := m.executeAutoApproveTools(approved, turn, &req)
+					if err != nil {
+						m.err = err
 						return
 					}
-					approved = append(approved, gateApproved...)
-					deniedOutputs = gateDenied
-					if len(stillPending) > 0 {
-						unsent, err := m.executeAutoApproveTools(approved, turn, &req)
-						if err != nil {
-							m.err = err
-							return
-						}
-						m.state.UnsentToolResults = append(m.state.UnsentToolResults, unsent...)
-						m.state.PendingToolCalls = stillPending
-						m.state.Status = ConversationStatusAwaitingApproval
-						break
-					}
+					m.state.UnsentToolResults = append(m.state.UnsentToolResults, unsent...)
+					m.state.PendingToolCalls = stillPending
+					m.state.Status = ConversationStatusAwaitingApproval
+					break
 				}
 				outputs, err := m.executeToolCallsForTurn(approved, turn, &req)
 				if err != nil {
@@ -410,35 +440,25 @@ func (m *ModelResult) run() {
 				break
 			}
 		}
-		approved, pending, err := PartitionToolCalls(m.ctx, m.input.Tools, calls, BuildTurnContext(nil, turn, &req), m.input.Approval)
+		approved, stillPending, deniedOutputs, err := m.gateToolCalls(calls, turn, &req)
 		if err != nil {
 			m.err = err
 			return
 		}
-		var deniedOutputs []components.InputsUnion1
-		if len(pending) > 0 {
-			gateApproved, stillPending, gateDenied, gateErr := m.applyPermissionRequestGate(pending)
-			if gateErr != nil {
-				m.err = gateErr
+		if len(stillPending) > 0 {
+			// Mixed approval turn (Run-2 punch-list item 14): execute the
+			// auto-approved calls and persist their outputs as unsent results
+			// *before* pausing for the approval-required calls, matching
+			// upstream handleApprovalCheck -> executeAutoApproveTools ordering.
+			unsent, err := m.executeAutoApproveTools(approved, turn, &req)
+			if err != nil {
+				m.err = err
 				return
 			}
-			approved = append(approved, gateApproved...)
-			deniedOutputs = gateDenied
-			if len(stillPending) > 0 {
-				// Mixed approval turn (Run-2 punch-list item 14): execute the
-				// auto-approved calls and persist their outputs as unsent results
-				// *before* pausing for the approval-required calls, matching
-				// upstream handleApprovalCheck -> executeAutoApproveTools ordering.
-				unsent, err := m.executeAutoApproveTools(approved, turn, &req)
-				if err != nil {
-					m.err = err
-					return
-				}
-				m.state.UnsentToolResults = append(m.state.UnsentToolResults, unsent...)
-				m.state.PendingToolCalls = stillPending
-				m.state.Status = ConversationStatusAwaitingApproval
-				break
-			}
+			m.state.UnsentToolResults = append(m.state.UnsentToolResults, unsent...)
+			m.state.PendingToolCalls = stillPending
+			m.state.Status = ConversationStatusAwaitingApproval
+			break
 		}
 		outputs, err := m.executeToolCallsForTurn(approved, turn, &req)
 		if err != nil {
@@ -454,6 +474,21 @@ func (m *ModelResult) run() {
 			// forceResume counter so an earlier override doesn't count
 			// against a later, independent one (mirrors upstream).
 			forceResumeCount = 0
+		}
+		if len(m.roundCalls) > 0 {
+			// Tool-declared NextTurnParams shape the follow-up request
+			// (applied before the accumulated input is rebuilt, mirroring
+			// upstream). A tool-computed toolChoice becomes the new
+			// caller-level policy (upstream #114).
+			next, changedChoice, err := applyToolNextTurnParams(m.ctx, m.input.Tools, m.roundResults, m.roundCalls, req)
+			if err != nil {
+				m.err = err
+				return
+			}
+			req = next
+			if changedChoice {
+				m.configuredToolChoice = req.ToolChoice
+			}
 		}
 		base := requestInputItems(req.Input)
 		base = append(base, responseItems...)
@@ -490,10 +525,122 @@ func (m *ModelResult) run() {
 		}
 		m.state = appendResponseItemsToState(m.state, retryResp, retryItems)
 	}
+	m.syncToolChoiceState()
 	if m.input.StateAccessor != nil {
 		if err := m.input.StateAccessor.Save(m.ctx, m.state); err != nil {
 			m.err = err
 		}
+	}
+}
+
+// isForcedToolChoice reports whether a caller-configured tool choice
+// requires the turn to call a tool.
+func isForcedToolChoice(choice *components.OpenAIResponsesToolChoiceUnion) bool {
+	switch {
+	case choice == nil:
+		return false
+	case choice.OpenAIResponsesToolChoiceAuto != nil, choice.OpenAIResponsesToolChoiceNone != nil:
+		return false
+	case choice.OpenAIResponsesToolChoiceRequired != nil:
+		return true
+	case choice.ToolChoiceAllowed != nil:
+		return choice.ToolChoiceAllowed.Mode.ModeRequired != nil
+	default:
+		// A specific-tool object (function, shell, apply_patch, …).
+		return true
+	}
+}
+
+// forcedToolChoiceKey is a stable identity for a concrete forced choice; ""
+// means the choice does not force a tool call.
+//
+// The key is canonical JSON with object keys sorted (the same bytes RFC 8785
+// JCS yields for these string/array/object-only values), mirroring upstream's
+// canonicalizeKeyMaterial, so it does not depend on struct field order.
+func forcedToolChoiceKey(choice *components.OpenAIResponsesToolChoiceUnion) string {
+	if !isForcedToolChoice(choice) {
+		return ""
+	}
+	b, err := json.Marshal(choice)
+	if err != nil {
+		return fmt.Sprintf("%#v", *choice)
+	}
+	var generic any
+	if err := json.Unmarshal(b, &generic); err != nil {
+		return string(b)
+	}
+	// encoding/json marshals map keys in sorted order.
+	canonical, err := json.Marshal(generic)
+	if err != nil {
+		return string(b)
+	}
+	return string(canonical)
+}
+
+// relaxForcedToolChoice relaxes a forcing tool choice for follow-up turns
+// after it produced a tool call (upstream relaxForcedToolChoice, DEV-785):
+// required -> auto; a specific tool -> auto; allowed_tools mode required ->
+// the same set with mode auto (the constraint on which tools may be used
+// still applies, only the force-a-call part is spent). auto/none/allowed
+// auto/nil pass through unchanged.
+func relaxForcedToolChoice(choice *components.OpenAIResponsesToolChoiceUnion) *components.OpenAIResponsesToolChoiceUnion {
+	if !isForcedToolChoice(choice) {
+		return choice
+	}
+	if choice.ToolChoiceAllowed != nil {
+		relaxed := *choice.ToolChoiceAllowed
+		relaxed.Mode = components.CreateModeModeAuto(components.ModeAutoAuto)
+		out := components.CreateOpenAIResponsesToolChoiceUnionToolChoiceAllowed(relaxed)
+		return &out
+	}
+	auto := components.CreateOpenAIResponsesToolChoiceUnionOpenAIResponsesToolChoiceAuto(components.OpenAIResponsesToolChoiceAutoAuto)
+	return &auto
+}
+
+// applyForcedToolChoicePolicy derives the wire tool choice for the next
+// caller-policy dispatch: an unchanged forced choice that already produced a
+// tool call is relaxed; a different forced value re-arms. It also prepares
+// the consumption bookkeeping committed by commitToolChoiceDispatch.
+// Engine-owned overrides (toolChoice none on the final/retry turns) are
+// applied separately and never commit caller state.
+func (m *ModelResult) applyForcedToolChoicePolicy(req *components.ResponsesRequest) {
+	key := forcedToolChoiceKey(m.configuredToolChoice)
+	if key != "" && key == m.consumedToolChoiceKey {
+		req.ToolChoice = relaxForcedToolChoice(m.configuredToolChoice)
+		m.pendingToolChoiceKey = nil
+		return
+	}
+	req.ToolChoice = m.configuredToolChoice
+	m.pendingToolChoiceKey = &key
+}
+
+// commitToolChoiceDispatch commits the prepared bookkeeping once the
+// dispatched response materialized: an unforced turn clears the consumed key
+// (re-arming the same forced value if it appears again later); a forced
+// choice is consumed only when that response called a tool.
+func (m *ModelResult) commitToolChoiceDispatch(hasToolCalls bool) {
+	pending := m.pendingToolChoiceKey
+	m.pendingToolChoiceKey = nil
+	if pending == nil {
+		return
+	}
+	if *pending == "" {
+		m.consumedToolChoiceKey = ""
+	} else if hasToolCalls {
+		m.consumedToolChoiceKey = *pending
+	}
+}
+
+// syncToolChoiceState persists the consumed forced-choice key on a paused
+// run so its resume keeps the choice relaxed, and clears it on a terminal
+// exit so a later fresh request forces again.
+func (m *ModelResult) syncToolChoiceState() {
+	switch m.state.Status {
+	case ConversationStatusAwaitingApproval, ConversationStatusAwaitingHITL, ConversationStatusAwaitingClientTools:
+		m.state.ConsumedForcedToolChoiceKey = m.consumedToolChoiceKey
+	default:
+		m.consumedToolChoiceKey = ""
+		m.state.ConsumedForcedToolChoiceKey = ""
 	}
 }
 
@@ -540,12 +687,24 @@ func consumeCreateResponse(res *operations.CreateResponsesResponse, onEvent func
 			resp := data.StreamEventsResponseCompleted.Response
 			completed = &resp
 		}
+		// response.incomplete is a terminal event carrying the (truncated)
+		// response, e.g. a max_output_tokens cut-off; response.failed carries
+		// the error. Both mirror upstream consumeStreamForCompletion.
+		if data.StreamEventsResponseIncomplete != nil {
+			resp := data.StreamEventsResponseIncomplete.Response
+			completed = &resp
+		}
+		if data.StreamEventsResponseFailed != nil {
+			failed := data.StreamEventsResponseFailed.Response
+			b, _ := json.Marshal(failed.Error)
+			return components.OpenResponsesResult{}, events, fmt.Errorf("response failed: %s", string(b))
+		}
 	}
 	if err := stream.Err(); err != nil {
 		return components.OpenResponsesResult{}, events, err
 	}
 	if completed == nil {
-		return components.OpenResponsesResult{}, events, errors.New("stream ended without response.completed")
+		return components.OpenResponsesResult{}, events, errors.New("stream ended without completion event")
 	}
 	return *completed, events, nil
 }
@@ -588,12 +747,32 @@ func (m *ModelResult) prepareResumeRequest(req *components.ResponsesRequest) (bo
 	for _, call := range m.state.PendingToolCalls {
 		switch {
 		case hasDecision(m.input.RejectToolCalls, call):
-			unsent = append(unsent, CreateRejectedResult(call, "Rejected by user"))
+			const reason = "Rejected by user"
+			if call.PreToolUseApplied {
+				// PreToolUse already ran for this call before the pause, so
+				// close its lifecycle with a failure (upstream emitPreparedFailure).
+				m.emitPreparedFailure(call, reason)
+			}
+			unsent = append(unsent, CreateRejectedResult(call, reason))
 		case hasDecision(m.input.ApproveToolCalls, call):
 			t := FindToolByName(m.input.Tools, call.Name)
 			if t == nil || !IsAutoResolvableTool(t) {
 				unsent = append(unsent, CreateRejectedResult(call, "Tool not found or not executable"))
 				continue
+			}
+			if !call.PreToolUseApplied {
+				// Legacy/unprepared pending call: run PreToolUse now and
+				// re-check approval on its effective arguments; a mutation
+				// that needs approval again re-pauses rather than executing.
+				effective, outcome, err := m.prepareAfterInitialApproval(call, BuildTurnContext(nil, turn, req))
+				if err != nil {
+					return false, err
+				}
+				if outcome == preparePending {
+					remaining = append(remaining, effective)
+					continue
+				}
+				call = effective
 			}
 			source := ToolSourceClient
 			if IsMcpTool(t) {
@@ -759,6 +938,7 @@ func (m *ModelResult) executeAutoApproveTools(calls []ParsedToolCall, turn int, 
 // loop stops without sending an incomplete output set to the model.
 func (m *ModelResult) executeToolCallsForTurn(calls []ParsedToolCall, turn int, req *components.ResponsesRequest) ([]components.InputsUnion1, error) {
 	var outputs []components.InputsUnion1
+	m.roundCalls, m.roundResults = nil, nil
 	for _, call := range calls {
 		t := FindToolByName(m.input.Tools, call.Name)
 		if t == nil || IsManualTool(t) {
@@ -809,6 +989,8 @@ func (m *ModelResult) executeToolCallsForTurn(calls []ParsedToolCall, turn int, 
 			return nil, err
 		}
 		m.toolStream.Push(ToolStreamEvent{Type: "tool.call.output", CallID: call.CallID, Name: call.Name, Source: source, Output: result.Output, Error: event.Error, Turn: turn})
+		m.roundCalls = append(m.roundCalls, effectiveCall)
+		m.roundResults = append(m.roundResults, result)
 		outputItem := components.CreateInputsUnion1FunctionCallOutputItem(out)
 		outputs = append(outputs, outputItem)
 		// Persist this output to state immediately so it survives a later HITL
@@ -974,25 +1156,54 @@ func (m *ModelResult) emitSessionEndOnce(reason SessionEndReason) {
 	m.sessionEndEmitted = true
 	payload := SessionEndPayload{Reason: reason}
 	if m.sessionUsage.modelCalls > 0 {
-		totals := SessionUsageTotals{
-			ModelCallUsage: ModelCallUsage{
-				InputTokens:     m.sessionUsage.inputTokens,
-				OutputTokens:    m.sessionUsage.outputTokens,
-				TotalTokens:     m.sessionUsage.totalTokens,
-				CachedTokens:    m.sessionUsage.cachedTokens,
-				ReasoningTokens: m.sessionUsage.reasoningTokens,
-			},
-			ModelCalls: m.sessionUsage.modelCalls,
-		}
-		if m.sessionUsage.hasCost {
-			cost := m.sessionUsage.cost
-			totals.Cost = &cost
-		}
+		totals := m.snapshotSessionUsage()
 		payload.TotalUsage = &totals
 	}
 	if _, err := m.hooksManager.EmitSessionEnd(payload, m.hookEmitOptions("")); err != nil {
 		log.Printf("[SessionEnd] hook error: %v", err)
 	}
+}
+
+// snapshotSessionUsage returns the run's aggregate usage. Cost is set only
+// when at least one response reported it (a summed 0 from cost-less responses
+// would read as "free" rather than "unknown"). Single source of truth for
+// both SessionEnd.TotalUsage and Usage, so the two cannot drift.
+func (m *ModelResult) snapshotSessionUsage() SessionUsageTotals {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	totals := SessionUsageTotals{
+		ModelCallUsage: ModelCallUsage{
+			InputTokens:     m.sessionUsage.inputTokens,
+			OutputTokens:    m.sessionUsage.outputTokens,
+			TotalTokens:     m.sessionUsage.totalTokens,
+			CachedTokens:    m.sessionUsage.cachedTokens,
+			ReasoningTokens: m.sessionUsage.reasoningTokens,
+		},
+		ModelCalls: m.sessionUsage.modelCalls,
+	}
+	if m.sessionUsage.hasCost {
+		cost := m.sessionUsage.cost
+		totals.Cost = &cost
+	}
+	return totals
+}
+
+// Usage returns aggregate token/cost usage across every model call this
+// ModelResult made: the initial request, each tool-round follow-up, the
+// empty-final retry, the AllowFinalResponse final turn, and approval-resume
+// requests (upstream getUsage, #97). Response returns only the final round's
+// response, so intermediate tool-call generations are otherwise unreachable.
+//
+// It waits for the run like Response does, but never fails: a failed run
+// still consumed tokens, so it returns the totals accrued so far (ModelCalls
+// 0 with zeroed tokens when no call completed) and logs the swallowed cause.
+// Totals are per-ModelResult: a resumed run reports only its own calls.
+func (m *ModelResult) Usage(ctx context.Context) SessionUsageTotals {
+	m.ensure()
+	if m.err != nil {
+		log.Printf("[Usage] run failed; reporting totals accrued so far: %v", m.err)
+	}
+	return m.snapshotSessionUsage()
 }
 
 // finishHooksSession emits SessionEnd (if not already emitted) and drains
@@ -1010,11 +1221,13 @@ func (m *ModelResult) finishHooksSession(reason SessionEndReason) {
 
 // emitPostModelCall emits PostModelCall for a completed model response and
 // folds its usage into the session aggregate. One emit per materialized response.
+//
+// Accumulation runs unconditionally — before the hooks short-circuit —
+// because Usage surfaces these totals to callers who configured no hooks at
+// all (upstream #97). Only the hook emit is gated on a HooksManager.
 func (m *ModelResult) emitPostModelCall(resp components.OpenResponsesResult, startedAt time.Time, turnType ModelCallTurnType, turnNumber int) {
-	if m.hooksManager == nil {
-		return
-	}
 	usage := extractModelCallUsage(resp)
+	m.mu.Lock()
 	m.sessionUsage.modelCalls++
 	if usage != nil {
 		m.sessionUsage.inputTokens += usage.InputTokens
@@ -1026,6 +1239,10 @@ func (m *ModelResult) emitPostModelCall(resp components.OpenResponsesResult, sta
 			m.sessionUsage.cost += *usage.Cost
 			m.sessionUsage.hasCost = true
 		}
+	}
+	m.mu.Unlock()
+	if m.hooksManager == nil {
+		return
 	}
 	payload := PostModelCallPayload{
 		SessionID:  m.state.ID,
@@ -1131,6 +1348,9 @@ func (m *ModelResult) emitPermissionRequest(call ParsedToolCall) (PermissionDeci
 	riskLevel := RiskLevelLow
 	if m.input.Approval != nil {
 		riskLevel = RiskLevelHigh
+	} else if p, ok := t.(approvalPredicateTool); ok && p.hasApprovalPredicate() {
+		// Derived from the gate's shape without invoking the predicate.
+		riskLevel = RiskLevelHigh
 	} else if t != nil {
 		if approvalTool, ok := t.(interface {
 			RequiresApproval(context.Context, ParsedToolCall, TurnContext) (bool, error)
@@ -1232,14 +1452,29 @@ func latestUserStringMessage(items []components.InputsUnion1) (int, string, bool
 // would, not be treated as a per-call rejection.
 func (m *ModelResult) runToolWithHooks(t Tool, call ParsedToolCall, execCtx ToolExecuteContext) (effectiveCall ParsedToolCall, result ToolExecutionResult, blocked bool, fatalErr error) {
 	effectiveCall = call
-	if m.hooksManager == nil {
+	execCtx.ConversationID = m.state.ID
+	if reason := call.preparedBlockReason; reason != "" && call.PreToolUseApplied {
+		// The verdict travels on this call occurrence itself, so duplicate
+		// call ids in one response, or a later response reusing an id, are
+		// each gated independently (upstream #94).
+		effectiveCall.preparedBlockReason = ""
+		return effectiveCall, ToolExecutionResult{CallID: call.CallID, Name: call.Name, Error: errors.New(reason)}, true, nil
+	}
+	if m.hooksManager == nil || call.PreToolUseApplied {
+		// No hooks, or PreToolUse already ran during preparation (its
+		// effective arguments are already on call): execute without
+		// re-applying it, but still close the lifecycle below when hooks
+		// are present.
+		startedAt := time.Now()
 		res, err := ExecuteTool(m.ctx, t, effectiveCall, execCtx)
 		if err != nil {
 			return effectiveCall, ToolExecutionResult{}, false, err
 		}
+		if m.hooksManager != nil {
+			m.emitPostToolHooks(effectiveCall, res, float64(time.Since(startedAt).Milliseconds()))
+		}
 		return effectiveCall, res, false, nil
 	}
-
 	toolInput := toolInputMap(call)
 	preResult, err := m.hooksManager.EmitPreToolUse(PreToolUsePayload{ToolName: call.Name, ToolInput: toolInput}, m.hookEmitOptions(call.Name))
 	if err != nil {
@@ -1263,18 +1498,172 @@ func (m *ModelResult) runToolWithHooks(t Tool, call ParsedToolCall, execCtx Tool
 	if err != nil {
 		return effectiveCall, ToolExecutionResult{}, false, err
 	}
-	durationMs := float64(time.Since(startedAt).Milliseconds())
+	m.emitPostToolHooks(effectiveCall, res, float64(time.Since(startedAt).Milliseconds()))
+	return effectiveCall, res, false, nil
+}
 
+// emitPostToolHooks emits PostToolUse or PostToolUseFailure for an executed call.
+func (m *ModelResult) emitPostToolHooks(effectiveCall ParsedToolCall, res ToolExecutionResult, durationMs float64) {
 	if res.Error != nil {
 		if _, hookErr := m.hooksManager.EmitPostToolUseFailure(PostToolUseFailurePayload{ToolName: effectiveCall.Name, ToolInput: toolInputMap(effectiveCall), Error: res.Error}, m.hookEmitOptions(effectiveCall.Name)); hookErr != nil {
 			log.Printf("[PostToolUseFailure] hook error: %v", hookErr)
 		}
-	} else {
-		if _, hookErr := m.hooksManager.EmitPostToolUse(PostToolUsePayload{ToolName: effectiveCall.Name, ToolInput: toolInputMap(effectiveCall), ToolOutput: res.Output, DurationMs: durationMs}, m.hookEmitOptions(effectiveCall.Name)); hookErr != nil {
-			log.Printf("[PostToolUse] hook error: %v", hookErr)
+		return
+	}
+	if _, hookErr := m.hooksManager.EmitPostToolUse(PostToolUsePayload{ToolName: effectiveCall.Name, ToolInput: toolInputMap(effectiveCall), ToolOutput: res.Output, DurationMs: durationMs}, m.hookEmitOptions(effectiveCall.Name)); hookErr != nil {
+		log.Printf("[PostToolUse] hook error: %v", hookErr)
+	}
+}
+
+type prepareOutcome int
+
+const (
+	prepareReady prepareOutcome = iota
+	prepareBlocked
+	preparePending
+)
+
+// gateToolCalls runs one response's tool calls through the approval gate,
+// mirroring upstream handleApprovalCheck/resolveApprovalPhases (#94):
+//
+//  1. Partition on the model's arguments (tool-level and call-level checks;
+//     predicates see normalized arguments, see ToolRequiresApproval).
+//  2. PermissionRequest for approval-required calls (allow/deny/ask_user).
+//  3. PreToolUse runs for every surviving auto-resolvable call *before*
+//     execution, and a hook-mutated input is re-checked against the
+//     approval gate, so a hook cannot rewrite approved safe arguments into
+//     an unapproved dangerous call.
+//
+// runnable are the effective calls to execute (in order; hook-blocked calls
+// stay in the list and surface as rejected outputs), stillPending need a
+// human decision (carrying PreToolUseApplied when the hook already ran),
+// and deniedOutputs are PermissionRequest denials to send this round.
+func (m *ModelResult) gateToolCalls(calls []ParsedToolCall, turn int, req *components.ResponsesRequest) (runnable, stillPending []ParsedToolCall, deniedOutputs []components.InputsUnion1, err error) {
+	tc := BuildTurnContext(nil, turn, req)
+	approved, pending, err := PartitionToolCalls(m.ctx, m.input.Tools, calls, tc, m.input.Approval)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	if len(pending) > 0 {
+		var gateApproved []ParsedToolCall
+		gateApproved, stillPending, deniedOutputs, err = m.applyPermissionRequestGate(pending)
+		if err != nil {
+			return nil, nil, nil, err
+		}
+		approved = append(approved, gateApproved...)
+	}
+	for _, call := range approved {
+		effective, outcome, err := m.prepareAfterInitialApproval(call, tc)
+		if err != nil {
+			return nil, nil, nil, err
+		}
+		if outcome == preparePending {
+			stillPending = append(stillPending, effective)
+			continue
+		}
+		runnable = append(runnable, effective)
+	}
+	return runnable, stillPending, deniedOutputs, nil
+}
+
+// prepareAfterInitialApproval runs PreToolUse for a call that passed the
+// initial approval gate and re-gates a mutated input (upstream
+// prepareAfterInitialApproval). Returns the effective call (marked
+// PreToolUseApplied when the hook ran) and whether it is ready to execute,
+// blocked (the verdict is recorded on the returned call occurrence), or
+// pending a human decision.
+func (m *ModelResult) prepareAfterInitialApproval(call ParsedToolCall, turn TurnContext) (ParsedToolCall, prepareOutcome, error) {
+	if m.hooksManager == nil || call.PreToolUseApplied {
+		return call, prepareReady, nil
+	}
+	t := FindToolByName(m.input.Tools, call.Name)
+	if t == nil || !IsAutoResolvableTool(t) {
+		return call, prepareReady, nil
+	}
+	// Raw (unparseable) arguments: nothing trustworthy to hand the hook;
+	// leave it to the execution path, which reports the parse error.
+	if call.Arguments == nil && call.RawArgs != "" {
+		if _, ok := toolInputFromRawArgs(call.RawArgs); !ok {
+			return call, prepareReady, nil
 		}
 	}
-	return effectiveCall, res, false, nil
+	pre, err := m.hooksManager.EmitPreToolUse(PreToolUsePayload{ToolName: call.Name, ToolInput: toolInputMap(call)}, m.hookEmitOptions(call.Name))
+	if err != nil {
+		return call, prepareReady, fmt.Errorf("PreToolUse hook: %w", err)
+	}
+	effective := call
+	effective.PreToolUseApplied = true
+	if pre.Blocked {
+		reason := pre.BlockReason
+		if reason == "" {
+			reason = "Blocked by PreToolUse hook"
+		}
+		effective.preparedBlockReason = reason
+		return effective, prepareBlocked, nil
+	}
+	if !pre.Mutated {
+		return effective, prepareReady, nil
+	}
+	effective.Arguments = pre.FinalPayload.ToolInput
+	effective.RawArgs = ""
+	if n, ok := t.(argumentNormalizer); ok {
+		if _, valid := n.normalizeArguments(effective); !valid {
+			return m.blockPreparedToolCall(effective, fmt.Sprintf("PreToolUse produced invalid input for %q", effective.Name)), prepareBlocked, nil
+		}
+	}
+	need, err := m.mutatedInputRequiresApproval(t, effective, turn)
+	if err != nil {
+		return effective, prepareReady, err
+	}
+	if !need {
+		return effective, prepareReady, nil
+	}
+	decision, reason, err := m.emitPermissionRequest(effective)
+	if err != nil {
+		return effective, prepareReady, err
+	}
+	switch decision {
+	case PermissionDecisionAllow:
+		return effective, prepareReady, nil
+	case PermissionDecisionDeny:
+		if reason == "" {
+			reason = "Denied by PermissionRequest hook"
+		}
+		return m.blockPreparedToolCall(effective, reason), prepareBlocked, nil
+	default:
+		return effective, preparePending, nil
+	}
+}
+
+// mutatedInputRequiresApproval re-checks a PreToolUse-mutated input. Only a
+// call-level check or a tool-level predicate can change its verdict with the
+// arguments; a static RequireApproval already decided at the first gate.
+func (m *ModelResult) mutatedInputRequiresApproval(t Tool, call ParsedToolCall, turn TurnContext) (bool, error) {
+	if m.input.Approval != nil {
+		return ToolRequiresApproval(m.ctx, t, call, turn, m.input.Approval)
+	}
+	if p, ok := t.(approvalPredicateTool); ok && p.hasApprovalPredicate() {
+		return t.RequiresApproval(m.ctx, call, turn)
+	}
+	return false, nil
+}
+
+// blockPreparedToolCall records the block verdict on the call occurrence
+// and closes its lifecycle with PostToolUseFailure (the hook already saw
+// PreToolUse).
+func (m *ModelResult) blockPreparedToolCall(call ParsedToolCall, reason string) ParsedToolCall {
+	call.preparedBlockReason = reason
+	m.emitPreparedFailure(call, reason)
+	return call
+}
+
+func (m *ModelResult) emitPreparedFailure(call ParsedToolCall, reason string) {
+	if m.hooksManager == nil {
+		return
+	}
+	if _, err := m.hooksManager.EmitPostToolUseFailure(PostToolUseFailurePayload{ToolName: call.Name, ToolInput: toolInputMap(call), Error: errors.New(reason)}, m.hookEmitOptions(call.Name)); err != nil {
+		log.Printf("[PostToolUseFailure] hook error: %v", err)
+	}
 }
 
 // toolInputMap best-effort converts a ParsedToolCall's arguments to

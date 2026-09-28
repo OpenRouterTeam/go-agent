@@ -9,10 +9,17 @@ import (
 type DynamicValue[T any] func(context.Context, TurnContext) (T, error)
 
 type CallModelInput struct {
-	Model              string
-	ModelFunc          DynamicValue[string]
-	Input              any
-	Tools              []Tool
+	Model     string
+	ModelFunc DynamicValue[string]
+	Input     any
+	Tools     []Tool
+	// ActiveTools, when non-nil, narrows Tools to the named client tools
+	// before API conversion and executor registration, so the model cannot
+	// call filtered tools (upstream #31). Server tools are always kept;
+	// unknown names are ignored. A filter that leaves no tools omits the
+	// request's tools entirely rather than sending an empty array. nil
+	// means every tool is active.
+	ActiveTools        []string
 	StopWhen           []StopCondition
 	AllowFinalResponse any
 	// StrictFinalResponse: when true, skips the one-shot retry that would

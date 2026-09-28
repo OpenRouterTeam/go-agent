@@ -20,6 +20,10 @@ type ToolExecuteContext struct {
 	Shared   map[string]any
 	Store    *ToolContextStore
 	Emit     func(any)
+	// ConversationID is the owning run's ConversationState.ID, set by the
+	// CallModel loop, so a tool can key external work to the conversation.
+	// Cancellation travels on the context.Context passed to Execute.
+	ConversationID string
 }
 
 func ConvertToolToAPI(t Tool) components.ResponsesRequestToolUnion { return t.ToAPITool() }
@@ -55,12 +59,33 @@ func ExecuteTool(ctx context.Context, t Tool, call ParsedToolCall, execCtx ToolE
 		raw = b
 	}
 	execCtx.ToolCall = call
+	// Turn.ToolCall is part of the tool-facing contract, but the streaming
+	// loop builds its turn context without one. Every executor path has the
+	// call in hand, so thread it (upstream #91): a caller-provided
+	// Turn.ToolCall wins, and the executed call fills the gap otherwise.
+	if execCtx.Turn.ToolCall == nil {
+		execCtx.Turn.ToolCall = toOutputFunctionCallItem(call, raw)
+	}
 	result, err := exec.Execute(ctx, raw, execCtx)
 	if err != nil {
 		return result, err
 	}
 	result.Source = source
 	return result, nil
+}
+
+// toOutputFunctionCallItem converts an executed ParsedToolCall back to the
+// wire-shaped function_call item threaded into TurnContext.ToolCall.
+func toOutputFunctionCallItem(call ParsedToolCall, raw json.RawMessage) *components.OutputFunctionCallItem {
+	item := &components.OutputFunctionCallItem{CallID: call.CallID, Name: call.Name, Arguments: string(raw), Type: components.OutputFunctionCallItemTypeFunctionCall}
+	if item.CallID == "" {
+		item.CallID = call.ID
+	}
+	if call.ID != "" {
+		id := call.ID
+		item.ID = &id
+	}
+	return item
 }
 
 func SanitizeSchema(schema map[string]any) map[string]any {

@@ -36,12 +36,36 @@ func FromChatMessages(messages []ChatMessage) ([]components.InputsUnion1, error)
 			out = append(out, components.CreateInputsUnion1FunctionCallOutputItem(components.FunctionCallOutputItem{CallID: m.ToolCallID, Output: components.CreateFunctionCallOutputItemOutputUnion2Str(result), Type: components.FunctionCallOutputItemTypeFunctionCallOutputFunctionCallOutput}))
 			continue
 		}
-		if text, ok := m.Content.(string); ok {
+		if m.Role == "assistant" {
+			// Upstream (#11/#41): an assistant message's content is
+			// stringified, and the message item is omitted only when it has
+			// no content AND tool calls replace it. A content-less assistant
+			// message with no tool calls still round-trips as an empty message.
+			content, err := contentToStringWithError(m.Content)
+			if err != nil {
+				return nil, fmt.Errorf("encode chat assistant content: %w", err)
+			}
+			if content != "" || len(m.ToolCalls) == 0 {
+				out = append(out, easyMessage(m.Role, components.CreateEasyInputMessageContentUnion2Str(content)))
+			}
+		} else if text, ok := m.Content.(string); ok {
 			out = append(out, easyMessage(m.Role, components.CreateEasyInputMessageContentUnion2Str(text)))
 		} else {
 			out = append(out, easyMessage(m.Role, components.CreateEasyInputMessageContentUnion2Any(m.Content)))
 		}
 		for _, call := range m.ToolCalls {
+			// Chat tool calls carry a single id; it becomes both the item id
+			// and the call_id, and `arguments` is forwarded as already
+			// serialized (never re-stringified).
+			callID := call.CallID
+			if callID == "" {
+				callID = call.ID
+			}
+			itemID := call.ID
+			if itemID == "" {
+				itemID = callID
+			}
+			status := components.ToolCallStatusCompleted
 			args := call.RawArgs
 			if args == "" && call.Arguments != nil {
 				b, err := json.Marshal(call.Arguments)
@@ -50,7 +74,7 @@ func FromChatMessages(messages []ChatMessage) ([]components.InputsUnion1, error)
 				}
 				args = string(b)
 			}
-			out = append(out, components.CreateInputsUnion1FunctionCallItem(components.FunctionCallItem{ID: callKey(call), CallID: call.CallID, Name: call.Name, Arguments: args, Type: components.FunctionCallItemTypeFunctionCall}))
+			out = append(out, components.CreateInputsUnion1FunctionCallItem(components.FunctionCallItem{ID: itemID, CallID: callID, Name: call.Name, Arguments: args, Status: &status, Type: components.FunctionCallItemTypeFunctionCall}))
 		}
 	}
 	return out, nil

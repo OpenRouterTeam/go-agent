@@ -2,11 +2,126 @@
 
 ## Unreleased
 
+### Partial sync toward `@openrouter/agent@0.11.0` (plus unreleased upstream fixes)
+
+This is a **partial** port of the upstream 0.9.0–0.11.0 range. The fixes and
+additions below are ported; the large new subsystems listed under "Not yet
+ported" are not, so this build must not be described as 0.11.0 parity.
+
+New API:
+
+- `ModelResult.Usage(ctx)` returns aggregate token/cost usage (`SessionUsageTotals`)
+  across every model call the run made — initial, tool rounds, the forced final
+  turn, the empty-final retry, and approval-resume requests. It waits for the run
+  like `Response`, never fails (a failed run returns the totals accrued so far),
+  and works with no hooks configured. `SessionEnd.TotalUsage` reads the same
+  snapshot.
+- `CallModelInput.ActiveTools` narrows `Tools` to the named client tools before
+  they are sent or registered for execution. Server tools are always kept,
+  unknown names are ignored, and filtering to nothing omits `tools` from the
+  request instead of sending an empty array.
+- `ToolConfig.NextTurnParams` is now applied by the `CallModel` loop after each
+  tool round (in `Tools` order, composing across tools and calls). Valid keys:
+  `input`, `toolChoice`, `model`, `models`, `temperature`, `maxOutputTokens`,
+  `topP`, `topK`, `instructions`. A `toolChoice` value lets a tool-search tool
+  widen an `allowed_tools` choice without touching `tools`, so the prompt-cache
+  prefix survives.
+- `ToolConfig.Strict` sets the function tool's `strict` flag on the wire.
+- `ToolConfig.WireInputSchema` lets a manual tool send a caller-owned JSON Schema
+  (for example `anyOf`/`oneOf`) as its wire `parameters`. It is copied and
+  sanitized. Setting it on an executable tool returns `ErrWireInputSchemaNotManual`.
+- `ResponseHasToolCalls(resp)` reports whether a response has tool calls the loop
+  would execute.
+- `ToolExecuteContext.ConversationID` carries the run's conversation id.
+- `ParsedToolCall.PreToolUseApplied` and
+  `ConversationState.ConsumedForcedToolChoiceKey` are new additive state fields.
+  They are optional within state version 1, and older blobs still load.
+
+Behavior changes:
+
+- **Function tools no longer send `strict: true` by default.** Unless
+  `ToolConfig.Strict` is set, they now send `strict: null` (the provider
+  default), as upstream does. Set `Strict: &true` to keep the old wire behavior.
+- **A forced `toolChoice` is relaxed after it produces a tool call.** This covers
+  `required`, a specific tool, and `allowed_tools` with mode `required`. Follow-up
+  turns send `auto` (or `allowed_tools` with mode `auto` and the same tool set),
+  so the model can answer in text instead of being forced to call tools until the
+  step budget runs out. The relaxation persists across approval, HITL, and
+  client-tool resumes, and is reset when the run completes. A different forced
+  value set later by `NextTurnParams` applies immediately.
+- **Truncated responses no longer execute tool calls.** If a response was cut off
+  at `max_output_tokens` (`status: incomplete`), the run finalizes on that turn
+  and none of its tool calls execute, including ones that completed before the
+  cut-off. The caller gets every output item and `IncompleteDetails`.
+  `ToolCallsStream` still reports the emitted calls. Streaming now treats
+  `response.incomplete` as a terminal event instead of reporting "stream ended",
+  and `response.failed` surfaces as an error.
+- **Approval gate hardening:**
+  - Tool-level `Approval` predicates and call-level `CallModelInput.Approval`
+    checks now receive arguments normalized the way `Execute` will decode them
+    (schema-validated, decoded into the input type, then re-encoded).
+  - A tool-level predicate fails closed (approval required) when the arguments
+    fail validation. A call-level check still runs, with the raw arguments.
+  - `PreToolUse` now runs before execution for every call that passed the
+    initial gate. A hook-mutated input is re-validated and re-checked against
+    predicate/call-level approval, so a hook can no longer turn approved safe
+    arguments into an unapproved dangerous call.
+  - Calls paused this way are persisted with their post-hook arguments and
+    `PreToolUseApplied`, and a resume does not re-apply the hook.
+  - `PostToolUseFailure` now fires for an invalid hook mutation, a
+    mutated-input denial, and a user rejection of an already-prepared call.
+  - `PermissionRequest` risk level is derived from the gate's shape. A predicate
+    now counts as `high` and is no longer invoked just to compute the risk level.
+- **Generator tools no longer accumulate their yields.** `Generate` yields are
+  still streamed live (`tool.preliminary`) but are no longer collected on
+  `ToolExecutionResult.Events`. The field is kept for source compatibility and is
+  always empty.
+- **`FromChatMessages` omits an empty assistant message that has tool calls.**
+  The `function_call` items replace it. Assistant content is stringified, and
+  each `function_call` item gets `status: completed` and uses the chat call id as
+  both `id` and `call_id`.
+- **`ToolExecuteContext.Turn.ToolCall` is now populated.** In the `CallModel`
+  loop it is filled from the executed call (a caller-provided value still wins),
+  so `Execute`/`OnToolCalled` can key on the call id.
+
+Compatibility notes:
+
+- The Go loop has no `validateFinalResponse`, so upstream's clarified
+  empty-final error messages (#45) have no Go counterpart. This is the existing
+  documented `StrictFinalResponse` divergence.
+- The `ModelResult.Usage` never-fails contract is expressed by returning only
+  `SessionUsageTotals` (no `error`). The swallowed run error is logged.
+- `ConsumedForcedToolChoiceKey` is sorted-key canonical JSON produced by Go's
+  `encoding/json`. It matches upstream's RFC 8785 key for ordinary ASCII tool
+  names. It can differ for names containing `<`, `>`, `&`, or non-BMP
+  characters. Go state blobs already use Go field names and are not
+  interchangeable with TypeScript state blobs.
+- Go streams keep the full replay history, which is upstream's default
+  retention mode. The upstream replay-buffer backlog fixes for its opt-in
+  compaction mode therefore have no Go counterpart yet.
+
+Not yet ported. These upstream features are absent from this build:
+
+- Doom-loop detection: the `doomLoop` option, `DoomLoopMonitor`, the
+  `DoomLoopDetected` hook, the escalation rung, and `SessionEnd` reason
+  `doom_loop`.
+- Async tools: the `run`/`lifecycle` (`background`/`deferred`) tools, the
+  universal `task` tool, steering (`SendToTask`/`QueueUserMessage`), subagent
+  tools (`tool.agent()`), per-tool `timeoutMs`/`toolTimeoutMs`,
+  `toolConcurrency`, `resumeToolResults`, the async tool events, and the
+  `awaiting_async_tools` status.
+- `createToolSet` (the tool-set activate/deactivate helper). Only the
+  `ActiveTools` filter it feeds is ported.
+- Opt-in stream replay compaction (`streamReplay: 'active-consumers'`).
+- The MCP integration now shipped under `@openrouter/agent/mcp`.
+
+---
+
 - Fixed a possible nil-pointer dereference in the `AllowFinalResponse` test path
   and lower-cased the `stop hook: …` wrapped error string to follow Go
   conventions (it was `Stop hook: …`). If you match on that error's text rather
   than using `errors.Is`/`errors.As`, update the comparison.
-- No behavior changes to the public API. The rest of this release is test and CI
+- The remaining entries in this section carry no public API behavior change: test and CI
   hardening: the race detector, a coverage ratchet, and per-required-symbol
   coverage are now enforced gates, and `ToolEventBroadcaster` plus the
   `stream_guards.go` predicates are now used by the streaming loop instead of
