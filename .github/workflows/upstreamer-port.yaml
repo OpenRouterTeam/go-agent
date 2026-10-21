@@ -26,6 +26,8 @@ name: Upstreamer Port
 #
 # Opens a PR. Never pushes to main. A failed parity eval leaves
 # .upstreamer/state.yaml unchanged, so the next run retries the same delta.
+# A converter that times out or aborts still pushes its partial tree, labelled
+# port-incomplete, so the work is inspectable rather than lost with the runner.
 
 on:
   repository_dispatch:
@@ -43,6 +45,11 @@ on:
         required: false
         default: false
         type: boolean
+      timeout_minutes:
+        description: "Converter time limit in minutes (max 300). Raise for large upstream ranges."
+        required: false
+        default: "120"
+        type: string
 
 permissions:
   contents: write
@@ -56,7 +63,10 @@ concurrency:
 jobs:
   port:
     runs-on: ubuntu-latest
-    timeout-minutes: 150
+    # Must exceed the converter limit (timeout_minutes, max 300) plus setup and
+    # PR steps. If the JOB times out, nothing after the port step runs and all
+    # partial work is lost, so the converter's own alarm must always fire first.
+    timeout-minutes: 330
     env:
       # Surfaced as env because the `secrets` context is NOT available in a
       # step-level `if:` (only github/needs/strategy/matrix/job/runner/env/vars/
@@ -103,20 +113,33 @@ jobs:
           fi
           echo "ref=$REF" >> "$GITHUB_OUTPUT"
 
+      # A timed-out or aborted converter does NOT fail this step. Its exit code is
+      # recorded instead, so the partial tree is still committed and pushed to the
+      # PR below (labelled port-incomplete) rather than discarded with the runner.
+      # The last step fails the job afterwards.
       - name: Run port
+        id: port
         env:
           # Provide these in repo settings:
           #   Secret   OPENROUTER_API_KEY  — sk-or-... key opencode uses for inference
           #   Variable OPENCODE_MODEL      — e.g. openrouter/~anthropic/claude-opus-latest
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
           OPENCODE_MODEL: ${{ vars.OPENCODE_MODEL }}
-          UPSTREAMER_TIMEOUT_SECONDS: 7200
+          TIMEOUT_MINUTES: ${{ inputs.timeout_minutes || '120' }}
         run: |
           set -euo pipefail
           if [ -z "${OPENROUTER_API_KEY:-}" ]; then
             echo "::error::OPENROUTER_API_KEY secret is not set. See .upstreamer/port.env.example."
             exit 1
           fi
+          case "$TIMEOUT_MINUTES" in
+            ''|*[!0-9]*) echo "::error::timeout_minutes must be a whole number, got '$TIMEOUT_MINUTES'"; exit 1 ;;
+          esac
+          if [ "$TIMEOUT_MINUTES" -lt 1 ] || [ "$TIMEOUT_MINUTES" -gt 300 ]; then
+            echo "::error::timeout_minutes must be between 1 and 300 (the job limit is 330), got $TIMEOUT_MINUTES"
+            exit 1
+          fi
+          export UPSTREAMER_TIMEOUT_SECONDS=$((TIMEOUT_MINUTES * 60))
           # Only pass --ref when there is actually a ref. `--ref ""` is not the
           # same as omitting it: the arg parser consumes the empty value and the
           # script would target an empty ref instead of defaulting to HEAD.
@@ -124,7 +147,15 @@ jobs:
           REF="${{ steps.target.outputs.ref }}"
           [ -n "$REF" ] && args+=(--ref "$REF")
           [ "${{ inputs.force }}" = "true" ] && args+=(--force)
-          ./scripts/upstream ${args[@]+"${args[@]}"}
+          rc=0
+          ./scripts/upstream ${args[@]+"${args[@]}"} || rc=$?
+          echo "rc=$rc" >> "$GITHUB_OUTPUT"
+          case "$rc" in
+            0) ;;
+            142) echo "::error::Converter hit the ${TIMEOUT_MINUTES}-minute limit. Partial work will be pushed to a port-incomplete PR. Re-run with a narrower ref or a larger timeout_minutes." ;;
+            4) echo "::error::Converter aborted (opencode ended on an error but exited 0). Partial work will be pushed to a port-incomplete PR." ;;
+            *) echo "::error::scripts/upstream exited $rc. Any partial work will be pushed to a port-incomplete PR." ;;
+          esac
 
       - name: Check for changes
         id: diff
@@ -136,18 +167,50 @@ jobs:
             echo "No changes — upstream unchanged or port was a no-op."
           fi
 
-      # State only advances when the verifier AND the parity eval passed, so an
-      # unchanged state file next to a changed tree means the port did not pass.
-      # Label the PR accordingly instead of letting it look green.
-      - name: Detect eval failure
+      # Three outcomes, labelled distinctly:
+      #   incomplete  — the converter did not finish (timeout, abort, error). The
+      #                 eval never ran to completion, so this says nothing about
+      #                 parity; the partial tree is pushed for inspection only.
+      #   eval-failed — the converter finished but state.yaml did not advance, so
+      #                 the verifier or the parity eval did not pass.
+      #   passed      — state.yaml advanced.
+      - name: Classify outcome
         if: steps.diff.outputs.changed == 'true'
         id: gate
+        env:
+          PORT_RC: ${{ steps.port.outputs.rc }}
         run: |
-          if git diff --quiet -- .upstreamer/state.yaml; then
-            echo "passed=false" >> "$GITHUB_OUTPUT"
+          set -euo pipefail
+          base="port: sync with @openrouter/agent upstream"
+          if [ "${PORT_RC:-1}" != "0" ]; then
+            # An unfinished run must never advance the port pointer, even if the
+            # converter happened to write state.yaml before it died.
+            git checkout -- .upstreamer/state.yaml
+            {
+              echo "status=incomplete"
+              echo "passed=false"
+              echo "title=$base (INCOMPLETE — converter did not finish, do not merge)"
+              echo "commit=port: partial sync with @openrouter/agent upstream (incomplete)"
+              echo "labels=upstreamer, automated, port-incomplete"
+            } >> "$GITHUB_OUTPUT"
+            echo "::warning::Converter exited $PORT_RC — pushing partial work as port-incomplete."
+          elif git diff --quiet -- .upstreamer/state.yaml; then
+            {
+              echo "status=eval-failed"
+              echo "passed=false"
+              echo "title=$base (EVAL FAILED — do not merge)"
+              echo "commit=$base"
+              echo "labels=upstreamer, automated, eval-failed"
+            } >> "$GITHUB_OUTPUT"
             echo "::warning::state.yaml did not advance — parity eval did not pass. See .upstreamer/eval-report.md."
           else
-            echo "passed=true" >> "$GITHUB_OUTPUT"
+            {
+              echo "status=passed"
+              echo "passed=true"
+              echo "title=$base"
+              echo "commit=$base"
+              echo "labels=upstreamer, automated"
+            } >> "$GITHUB_OUTPUT"
           fi
 
       # Mint a GitHub App installation token so the PR is created by the App
@@ -198,22 +261,22 @@ jobs:
           token: ${{ steps.app-token.outputs.token || secrets.GITHUB_TOKEN }}
           branch: upstreamer/sync
           delete-branch: true
-          title: >-
-            ${{ steps.gate.outputs.passed == 'true'
-              && 'port: sync with @openrouter/agent upstream'
-              || 'port: sync with @openrouter/agent upstream (EVAL FAILED — do not merge)' }}
-          commit-message: "port: sync with @openrouter/agent upstream"
-          labels: >-
-            ${{ steps.gate.outputs.passed == 'true'
-              && 'upstreamer, automated'
-              || 'upstreamer, automated, eval-failed' }}
+          title: ${{ steps.gate.outputs.title }}
+          commit-message: ${{ steps.gate.outputs.commit }}
+          labels: ${{ steps.gate.outputs.labels }}
           body: |
             Automated Upstreamer port of `@openrouter/agent` into this repo.
 
+            - Outcome: **${{ steps.gate.outputs.status }}** (converter exit code `${{ steps.port.outputs.rc }}`)
+            - Run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }} (logs in the `upstreamer-logs` artifact)
             - Contract: `.upstreamer/upstreamer.md`
-            - Run log: `.upstreamer/logs/`
             - Parity eval: `.upstreamer/eval-report.md`
             - Parity eval passed: **${{ steps.gate.outputs.passed }}**
+
+            `port-incomplete` means the converter was cut off (time limit, abort, or
+            error) before it finished, so this tree is partial work and the eval
+            result above is not meaningful. `eval-failed` means the converter
+            finished but the verifier or the parity eval did not pass.
 
             Review the diff as a port, not as a normal PR: check behavioral parity
             against the TypeScript reference, not just that it compiles. If
@@ -238,6 +301,22 @@ jobs:
           echo "::warning::PORT_BOT_APP_ID / PORT_BOT_PRIVATE_KEY are not configured, so this PR was opened with GITHUB_TOKEN and will receive NO pull_request-event checks. The dispatched run below is informational only and does not gate this diff — do not read it as a passing check. Configure the App (see PORTING.md) or close and reopen the PR by hand to generate real checks."
           gh workflow run ci.yaml --repo "$GITHUB_REPOSITORY" --ref upstreamer/sync
 
+      # create-pull-request only ever ADDS labels, so a PR reused across runs
+      # would keep a stale outcome label. Drop the ones that no longer apply.
+      - name: Clear stale outcome labels
+        if: >-
+          steps.diff.outputs.changed == 'true'
+          && steps.open-pr.outputs.pull-request-number != ''
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR: ${{ steps.open-pr.outputs.pull-request-number }}
+          STATUS: ${{ steps.gate.outputs.status }}
+        run: |
+          for label in eval-failed port-incomplete; do
+            [ "$label" = "$STATUS" ] && continue
+            gh pr edit "$PR" --repo "$GITHUB_REPOSITORY" --remove-label "$label" 2>/dev/null || true
+          done
+
       - name: Upload logs
         if: always()
         uses: actions/upload-artifact@v4
@@ -245,3 +324,13 @@ jobs:
           name: upstreamer-logs
           path: .upstreamer/logs/
           if-no-files-found: ignore
+
+      # The port step records a converter failure instead of failing, so that the
+      # partial work above still gets pushed. Fail the job here so the run is red.
+      - name: Fail if the converter did not finish
+        if: steps.port.outputs.rc != '0'
+        env:
+          PORT_RC: ${{ steps.port.outputs.rc }}
+        run: |
+          echo "::error::Converter did not finish (exit $PORT_RC). See the port-incomplete PR, if any, and the upstreamer-logs artifact."
+          exit 1
