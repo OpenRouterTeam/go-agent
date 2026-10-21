@@ -2,13 +2,141 @@
 
 ## Unreleased
 
+### Doom-loop detection (ported from `@openrouter/agent` work after 0.8.0, not yet in an upstream release)
+
+- Added opt-in doom-loop detection via `CallModelInput.DoomLoop`. It catches
+  runs that stop making progress while still spending: the model re-issuing the
+  same tool call with identical arguments in consecutive rounds (including
+  repeated empty `{}` calls), repeating identical server-tool requests (for
+  example `web_search_call`, detected after the response lands), or emitting the
+  same text over and over, either within one response or across turns.
+  `&agent.DoomLoopConfig{}` turns on the defaults. `nil` (the default) leaves it off.
+- Detection is deterministic and goes through a graduated ladder (`DoomLoopLadder`):
+  `observe` emits the new `DoomLoopDetected` hook, `steer` injects corrective
+  guidance before the next request, `escalate` runs the next turn with more help,
+  `block` refuses the call before it executes and returns an explanatory tool
+  error, and `stop` halts before any further model request. The defaults are
+  observe at 2, block at 3, and stop at 6. When a stop happens, unresolved calls
+  in the final turn get synthesized halt-error outputs so the persisted history
+  stays well-formed, `SessionEnd` reports the new `SessionEndReasonDoomLoop`
+  (`"doom_loop"`), and `ModelResult.DoomLoopVerdict(ctx)` returns the verdict that
+  stopped the run.
+- `escalate` rung: set `DoomLoopConfig.Escalation` to run the next turn on a
+  stronger `Model` (a one-turn override that reverts automatically), to force an
+  `openrouter:advisor` consult (`Advisor: true`, or `AdvisorParameters` for custom
+  advisor settings), or both. The advisor tool is appended with
+  `forward_transcript` and loop-diagnosing instructions, and `tool_choice` is
+  pinned to it. A notice naming the loop goes with the escalated turn. Escalations
+  are capped by `MaxEscalations` (default 2). Budget is consumed only when an
+  escalation is actually applied, the count persists across resumes, and two
+  detectors firing in the same window escalate only once. A spent or
+  unconfigured escalation falls through to the weaker rungs.
+- `DoomLoopDetected` handlers can override the action for each event with
+  `DoomLoopDetectedResult.OverrideAction` (the last override wins). A `block`
+  override on a text or server-tool verdict downgrades to `observe`, and an
+  `escalate` override without config or remaining budget also downgrades to
+  `observe`. The hook can be registered with `HooksManager.OnDoomLoopDetected` or
+  `InlineHookConfig.DoomLoopDetected`.
+- Tools can declare what makes two calls "the same" with `ToolConfig.LoopKey`:
+  `agent.LoopKeyFields("command", "cwd")` (a declarative field subset),
+  `agent.LoopKeyFunc(func(in Args) (any, error) {...})` (computed key material;
+  return `nil` to exempt that call), or `agent.LoopKeyExempt()` (the tool is never
+  checked). Without a declaration, the full arguments object is the identity.
+  `MarkMcp` takes an optional `MarkMcpOptions{LoopKey: ...}` for MCP-wrapped
+  tools. A loop key that errors or panics falls back to the full arguments, so
+  detection never fails a run.
+- Streaks are round-scoped: identical calls fanned out in parallel within one
+  turn count once and share one decision. Detector state persists in the new
+  `ConversationState.DoomLoop` field, so streaks survive serialize and resume
+  (pass `DoomLoop` again when resuming). The field is additive within
+  `ConversationStateVersion` 1. A stop verdict survives approve/reject-only
+  resumes and is cleared by a fresh conversational turn. Steer guidance queued
+  at a pause is delivered after the resume. A corrupt detector blob is ignored
+  instead of failing deserialization. Resolving a config logs a warning for dead
+  rungs, for `block` without `stop`, and for an `escalate` rung without a
+  mechanism (or a mechanism without the rung).
+- Fingerprints follow the cross-port contract: RFC 8785 (JCS) canonicalization
+  plus SHA-256 (`CanonicalizeKeyMaterial`, `FingerprintToolCall`,
+  `FingerprintKeyMaterial`). They match upstream's conformance vectors
+  byte-for-byte (see the compatibility note on unpaired surrogates). The primitives (`DoomLoopMonitor`, `DetectTextRepetition`,
+  `ResolveLadderAction`, `ResolveDoomLoopOption`, `ResolveLoopKeyMaterial`) are
+  exported for direct use.
+- On the first response of a call, an approval pause (including running the
+  turn's auto-approved calls) or an all-client-tools pause takes precedence over
+  a doom stop, as upstream. The armed verdict is persisted, so the following
+  approve/reject resume stays halted. On later turns, the stop seals the
+  turn's calls first.
+- Documented limits, as upstream: loops whose arguments vary each time (for
+  example a fresh nonce) evade the default identity unless the tool declares a
+  `LoopKey`. Paraphrased text repetition is not detected. Manual or
+  client-executed tool calls are not recorded.
+
+### Run cancellation
+
+- Cancelling the `ctx` passed to `CallModel`, or calling `result.Cancel()`, now
+  reliably stops the run at the next turn boundary *and* fails before any
+  further dispatch. A pre-cancelled ctx fails without touching the network,
+  and every consumer returns the cancellation cause (`context.Cause`, so a
+  `context.WithCancelCause` reason comes through). Before this change, a
+  cancelled ctx was only noticed by the HTTP transport.
+- An in-flight request aborted by cancellation now fails with the cancellation
+  cause (wrapped together with the transport error) instead of only a
+  transport-specific error.
+
+### Compatibility notes
+
+- Upstream's new `signal` option maps to the `ctx` argument (context
+  cancellation instead of `AbortSignal`). Upstream also composes
+  `RequestOptions.timeoutMs` with the signal to work around a TypeScript SDK
+  quirk. The Go SDK already derives a fresh per-request timeout from the run ctx
+  (`SDKOptions.Timeout`), so it needs no composition step and no new option.
+- Go has no `undefined`. A `LoopKeyFunc` that returns `nil` exempts the call
+  (upstream `null`). Upstream's "returned `undefined` → warn and fall back" case
+  has no Go equivalent. Return an error to fall back instead.
+- Ladder thresholds use `DoomLoopThreshold`: `0` means use the default, a
+  positive value is the threshold, and `agent.DoomLoopRungDisabled` (any negative
+  value) is upstream's `false`.
+- Upstream's "repeated invalid-JSON tool call" scenario does not arise in this
+  port. Function calls whose arguments are not valid JSON are dropped when tool
+  calls are extracted (this is long-standing go-agent behavior), so such a turn
+  ends the run instead of looping on parse errors.
+- Go strings are UTF-8, so `encoding/json` decodes an unpaired UTF-16
+  surrogate escape (for example `"\ud800"`) in tool arguments to U+FFFD.
+  Arguments containing one therefore fingerprint differently from the
+  TypeScript port. `CanonicalizeKeyMaterial` does escape a surrogate carried
+  as WTF-8 bytes exactly as upstream would, which is what upstream's
+  conformance vector for this case checks. Every other upstream vector matches
+  as-is. Text normalization uses ECMAScript's `\s` whitespace set (not
+  `unicode.IsSpace`), so text fingerprints match upstream.
+- Server-tool fingerprints are computed from the output item's wire JSON fields
+  (snake_case). They are stable within go-agent but not byte-identical to the
+  TypeScript port's server-tool fingerprints, which upstream's cross-port vectors
+  do not cover. Client tool-call and text fingerprints are identical across
+  ports.
+- An error from a `DoomLoopDetected` handler under `ThrowOnHandlerError` is
+  logged and the resolved ladder action still applies. Detection never fails a
+  run.
+- A doom stop on an approve/reject resume records the executed outputs in the
+  conversation messages (well-formed `function_call` → `function_call_output`)
+  and sends no follow-up request. The next fresh-input call continues from
+  there.
+- go-agent caps a run at `CallModelInput.MaxTurns` model requests, which
+  defaults to 5. Upstream's loop has no default cap. With the default cap, the
+  default `stop` rung (6 consecutive identical rounds) cannot fire inside one
+  call; `observe` and `block` still do. Raise `MaxTurns`, or lower
+  `Ladder.Stop`, if you want the stop rung to bound long runs.
+- Tool execution in this port is sequential, so doom-loop evaluations record in
+  the order the model emitted the calls, with no extra serialization step.
+
+### Maintenance
+
 - Fixed a possible nil-pointer dereference in the `AllowFinalResponse` test path
   and lower-cased the `stop hook: …` wrapped error string to follow Go
   conventions (it was `Stop hook: …`). If you match on that error's text rather
   than using `errors.Is`/`errors.As`, update the comparison.
-- No behavior changes to the public API. The rest of this release is test and CI
-  hardening: the race detector, a coverage ratchet, and per-required-symbol
-  coverage are now enforced gates, and `ToolEventBroadcaster` plus the
+- Apart from the doom-loop detection and cancellation work above, the rest of
+  this release is test and CI hardening: the race detector, a coverage ratchet,
+  and per-required-symbol coverage are now enforced gates, and `ToolEventBroadcaster` plus the
   `stream_guards.go` predicates are now used by the streaming loop instead of
   sitting alongside duplicate inline logic.
 
@@ -97,6 +225,15 @@
 | `markMcp(tool)` / `isMcpTool(tool)` | `MarkMcp(tool) Tool` / `IsMcpTool(tool) bool` |
 | tool result / stream event `source` | `Source ToolSource` (`ToolSourceClient` / `ToolSourceMCP`) on `ToolExecutionResult`, `ToolStreamEvent`, `ToolResultEvent` |
 | `awaiting_client_tools` | `ConversationStatusAwaitingClientTools` |
+| `doomLoop` option (`true` / config) | `DoomLoop *DoomLoopConfig` on `CallModelInput` (`&DoomLoopConfig{}` / config) |
+| `result.getDoomLoopVerdict()` | `result.DoomLoopVerdict(ctx)` |
+| tool `loopKey` (function / field list / `false`) | `ToolConfig.LoopKey` (`LoopKeyFunc` / `LoopKeyFields` / `LoopKeyExempt`) |
+| `markMcp(tool, { loopKey })` | `MarkMcp(tool, MarkMcpOptions{LoopKey: ...})` |
+| `DoomLoopDetected` hook | `HooksManager.OnDoomLoopDetected` / `InlineHookConfig.DoomLoopDetected` |
+| `DoomLoopMonitor`, `detectTextRepetition`, `resolveLadderAction`, `resolveDoomLoopOption`, `resolveLoopKeyMaterial` | `DoomLoopMonitor` (`NewDoomLoopMonitor`), `DetectTextRepetition`, `ResolveLadderAction`, `ResolveDoomLoopOption`, `ResolveLoopKeyMaterial` |
+| `canonicalizeKeyMaterial`, `fingerprintKeyMaterial`, `fingerprintToolCall` | `CanonicalizeKeyMaterial`, `FingerprintKeyMaterial`, `FingerprintToolCall` (`(string, error)`) |
+| `DEFAULT_DOOM_LOOP_LADDER`, `DEFAULT_MAX_ESCALATIONS`, `MAX_CANONICALIZE_DEPTH` | `DefaultDoomLoopLadder()`, `DefaultMaxEscalations`, `MaxCanonicalizeDepth` |
+| `signal` option | the `ctx` argument to `CallModel` |
 
 ## Compatibility Notes
 

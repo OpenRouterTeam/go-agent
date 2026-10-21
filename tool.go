@@ -27,6 +27,12 @@ type ToolConfig[In any] struct {
 	Approval           ToolApprovalCheck
 	OnToolCalled       func(context.Context, In, ToolExecuteContext) (any, bool, error)
 	OnResponseReceived func(context.Context, any, ToolExecuteContext) (any, error)
+	// LoopKey declares this tool's doom-loop call identity (upstream
+	// `loopKey`): LoopKeyFunc (computed key material; nil exempts a call),
+	// LoopKeyFields (declarative field subset), or LoopKeyExempt (static
+	// exemption). nil: the full arguments object is the identity. Only
+	// consulted when CallModelInput.DoomLoop is set.
+	LoopKey *ToolLoopKey
 }
 
 type TypedTool[In any] struct {
@@ -88,6 +94,8 @@ func (t *TypedTool[In]) RequiresApproval(ctx context.Context, call ParsedToolCal
 	}
 	return t.config.RequireApproval, nil
 }
+
+func (t *TypedTool[In]) toolLoopKey() *ToolLoopKey { return t.config.LoopKey }
 
 func (t *TypedTool[In]) HandleResponseReceived(ctx context.Context, output any, execCtx ToolExecuteContext) (any, error) {
 	if t.config.OnResponseReceived == nil {
@@ -254,9 +262,21 @@ func deepCopyJSONValue(v any) any {
 // unmarked tool. Execute is forwarded explicitly (rather than inherited via
 // embedding, which only promotes the narrow Tool interface) so a marked
 // executable tool keeps executing normally.
-type mcpBrand struct{ Tool }
+type mcpBrand struct {
+	Tool
+	loopKey *ToolLoopKey
+}
 
 func (b mcpBrand) isMcpTool() {}
+
+// toolLoopKey returns the MarkMcp-attached loop key, else the wrapped
+// tool's own declaration.
+func (b mcpBrand) toolLoopKey() *ToolLoopKey {
+	if b.loopKey != nil {
+		return b.loopKey
+	}
+	return loopKeyOf(b.Tool)
+}
 
 func (b mcpBrand) Execute(ctx context.Context, raw json.RawMessage, execCtx ToolExecuteContext) (ToolExecutionResult, error) {
 	exec, ok := b.Tool.(ToolWithExecute)
@@ -275,8 +295,26 @@ type mcpMarked interface{ isMcpTool() }
 // classification (and downstream Source discrimination on
 // ToolExecutionResult/ToolStreamEvent) now identifies it as MCP-originated.
 // Intended for use by an MCP integration package that wraps remote tools.
-func MarkMcp(t Tool) Tool {
-	return mcpBrand{Tool: t}
+//
+// An optional MarkMcpOptions.LoopKey attaches a doom-loop identity to the
+// wrapped tool — the only injection point for MCP tools, whose remote
+// definitions cannot carry client-side functions. Prefer LoopKeyFields
+// (data, not code). Ignored for server tools, matching upstream's
+// client-tool-only attachment.
+func MarkMcp(t Tool, opts ...MarkMcpOptions) Tool {
+	brand := mcpBrand{Tool: t}
+	for _, o := range opts {
+		if o.LoopKey != nil && IsClientTool(t) {
+			brand.loopKey = o.LoopKey
+		}
+	}
+	return brand
+}
+
+// MarkMcpOptions configures MarkMcp.
+type MarkMcpOptions struct {
+	// LoopKey attaches a doom-loop identity to the wrapped tool.
+	LoopKey *ToolLoopKey
 }
 
 // IsMcpTool reports whether tool carries the additive MCP brand (see MarkMcp).

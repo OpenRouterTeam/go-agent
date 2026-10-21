@@ -92,7 +92,7 @@ Use `StepCountIs`, `HasToolCall`, `MaxTokensUsed`, `MaxCost`, `FinishReasonIs`, 
 
 ## Lifecycle Hooks
 
-`HooksManager` (`agent.NewHooksManager`) supports the nine built-in lifecycle hooks — `PreToolUse`, `PostToolUse`, `PostToolUseFailure`, `UserPromptSubmit`, `Stop`, `PermissionRequest`, `SessionStart`, `SessionEnd`, and `PostModelCall` — plus fully custom hooks via the generic `agent.On`/`agent.Emit`. Register handlers with the typed `OnXxx` methods (e.g. `manager.OnPreToolUse(...)`) and pass the manager on `CallModelInput.Hooks`:
+`HooksManager` (`agent.NewHooksManager`) supports the ten built-in lifecycle hooks — `PreToolUse`, `PostToolUse`, `PostToolUseFailure`, `UserPromptSubmit`, `Stop`, `PermissionRequest`, `SessionStart`, `SessionEnd`, `PostModelCall`, and `DoomLoopDetected` — plus fully custom hooks via the generic `agent.On`/`agent.Emit`. Register handlers with the typed `OnXxx` methods (e.g. `manager.OnPreToolUse(...)`) and pass the manager on `CallModelInput.Hooks`:
 
 ```go
 hooks := agent.NewHooksManager()
@@ -110,6 +110,26 @@ result, err := agent.CallModel(ctx, client, agent.CallModelInput{
 ```
 
 `SessionStart`/`SessionEnd` fire once per non-resuming run (`SessionEnd` carries aggregated token usage across that run's model calls); an approval/HITL resume call is a continuation of the same session and does not get its own pair. `PostModelCall` fires once per model response, tagged `initial`/`resume`/`tool_round`/`final`/`retry`. `PreToolUse`/`PostToolUse`/`PostToolUseFailure` fire around every client-tool execution path, including during a resume. `PermissionRequest` fires before the human-approval pause and can `allow`/`deny`/`ask_user` (default) a gated call. `Stop` fires whenever a stop condition halts the loop mid-tool-call and can force a resume and/or inject a prompt. `UserPromptSubmit` fires once per non-resuming run against the initial user input and can mutate or reject it. Session identity is threaded per emit, so one `HooksManager` is safe to share across concurrent `CallModel` runs. Call `manager.Drain()` to await fire-and-forget handler work; go-agent always drains on every exit path, including no-tools error paths.
+
+## Doom-Loop Detection
+
+Set `CallModelInput.DoomLoop` to catch runs that stop making progress while continuing to spend: the same tool call with identical arguments in consecutive rounds (including repeated empty `{}` calls), repeated identical server-tool requests, or the same text repeated within or across responses. `&agent.DoomLoopConfig{}` enables the defaults (observe at 2 consecutive identical rounds, block at 3, stop at 6); `nil` (the default) leaves detection off. A run is also capped at `MaxTurns` requests (default 5), so raise `MaxTurns` or lower `Ladder.Stop` if you want the stop rung to bound the run.
+
+```go
+result, err := agent.CallModel(ctx, client, agent.CallModelInput{
+    Model:    "openai/gpt-4o-mini",
+    Input:    "...",
+    Tools:    []agent.Tool{searchTool},
+    DoomLoop: &agent.DoomLoopConfig{Ladder: agent.DoomLoopLadder{Steer: 3, Block: 4, Stop: 8}},
+})
+verdict, err := result.DoomLoopVerdict(ctx) // non-nil when detection stopped the run
+```
+
+The ladder escalates `observe` (emit the `DoomLoopDetected` hook) → `steer` (inject corrective guidance before the next request) → `escalate` (run the next turn on `Escalation.Model` and/or force an `openrouter:advisor` consult, budgeted by `MaxEscalations`) → `block` (refuse the call with an explanatory tool error) → `stop` (halt before any further model request; `SessionEnd` reason `doom_loop`). A zero threshold uses the default, `agent.DoomLoopRungDisabled` turns a rung off. `DoomLoopDetected` handlers can override the action per event. Streaks are round-scoped (parallel identical calls in one turn count once) and persist in `ConversationState.DoomLoop`, so pass `DoomLoop` again when resuming. Tools declare call identity with `ToolConfig.LoopKey`: `agent.LoopKeyFields("command", "cwd")`, `agent.LoopKeyFunc(func(in Args) (any, error) {...})` (return `nil` to exempt a call), or `agent.LoopKeyExempt()`; `agent.MarkMcp(tool, agent.MarkMcpOptions{LoopKey: ...})` attaches one to an MCP-wrapped tool. Fingerprints are RFC 8785 + SHA-256 and match the TypeScript and Python ports' conformance vectors (arguments carrying unpaired UTF-16 surrogates are the one documented exception, since Go strings are UTF-8).
+
+## Cancellation
+
+The `ctx` passed to `CallModel` cancels the whole run: a canceled ctx (or `result.Cancel()`) stops the loop at the next turn boundary and aborts any in-flight request, and every consumer returns the cancellation cause (`context.Cause`, so `context.WithCancelCause` reasons propagate). A pre-canceled ctx fails before any network dispatch. `SDKOptions.Timeout` bounds each request independently.
 
 ## Format Compatibility
 
