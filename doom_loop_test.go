@@ -249,7 +249,8 @@ func TestDetectTextRepetition(t *testing.T) {
 		t.Fatalf("DOCUMENTED MISS: paraphrase must not fire: %#v", r)
 	}
 	text := strings.TrimSpace(strings.Repeat("loop detected ", 8))
-	if *DetectTextRepetition(text, DoomLoopTextOptions{}) != *DetectTextRepetition(text, DoomLoopTextOptions{}) {
+	first, second := DetectTextRepetition(text, DoomLoopTextOptions{}), DetectTextRepetition(text, DoomLoopTextOptions{})
+	if first == nil || second == nil || *first != *second {
 		t.Fatal("must be deterministic")
 	}
 	var filler strings.Builder
