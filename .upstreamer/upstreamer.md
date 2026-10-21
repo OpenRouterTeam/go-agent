@@ -29,7 +29,7 @@ Explicitly out of scope:
 The port sits on the official OpenRouter Go SDK and must not reimplement HTTP,
 auth, retries, or generated model types.
 
-- Target: `github.com/OpenRouterTeam/go-sdk v0.5.4` (current `go.mod` pin).
+- Target: `github.com/OpenRouterTeam/go-sdk v0.5.10` (current `go.mod` pin).
 - `CallModel` sends through `client.Beta.Responses.Send` — the Responses API.
 - Request, response, item, stream, usage, and tool union types alias the
   generated SDK's component types where possible.
@@ -41,6 +41,15 @@ Known workaround to preserve: the Responses request pins `service_tier` to
 `auto`, working around a marshalling bug in the current Go SDK that emitted an
 invalid `service_tier` token. Do not remove this until the SDK pin moves past the
 fix.
+
+Known constraint, do not regress: response output items are carried into the next
+turn's input **unchanged**, as upstream does with `response.output`. Assistant
+`message` items keep their `content` array, including `output_text` annotations
+such as `url_citation`. `v0.5.10` is the floor for this: below it, `InputsUnion1`
+panics when it decodes array content. The port used to work around that panic by
+flattening content to a string, which silently dropped annotations from every
+follow-up request. Do not move the pin below `v0.5.10`, and do not reintroduce
+content flattening or any other rewrite of output items before re-sending them.
 
 ## Module Version
 

@@ -1,9 +1,9 @@
 module github.com/OpenRouterTeam/go-agent
 
-go 1.25
+go 1.25.10
 
 require (
-	github.com/OpenRouterTeam/go-sdk v0.5.4
+	github.com/OpenRouterTeam/go-sdk v0.5.10
 	github.com/invopop/jsonschema v0.13.0
 )
 
