@@ -41,6 +41,16 @@ type CallModelInput struct {
 	// Hooks accepts either a *HooksManager or an InlineHookConfig. See
 	// ResolveHooks. nil means no hooks.
 	Hooks any
+	// DoomLoop enables doom-loop detection (upstream `doomLoop`): catch runs
+	// that repeat the same tool call with identical arguments (including
+	// repeated empty calls), repeat identical server-tool requests, or emit
+	// the same text over and over, and respond with a graduated ladder
+	// (observe → steer → escalate → block → stop; defaults observe@2,
+	// block@3, stop@6). nil (the default) disables detection;
+	// &DoomLoopConfig{} is upstream's `doomLoop: true`. Tools declare
+	// precise call identity via ToolConfig.LoopKey. Pass it again on a
+	// resuming call for persisted streaks to keep counting.
+	DoomLoop *DoomLoopConfig
 }
 
 type CallModelInputWithState = CallModelInput

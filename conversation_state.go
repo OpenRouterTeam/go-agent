@@ -156,6 +156,10 @@ func UpdateState(state ConversationState, mutate func(*ConversationState)) Conve
 	copyState.Messages = append([]components.InputsUnion1{}, state.Messages...)
 	copyState.PendingToolCalls = append([]ParsedToolCall{}, state.PendingToolCalls...)
 	copyState.UnsentToolResults = append([]UnsentToolResult{}, state.UnsentToolResults...)
+	if state.DoomLoop != nil {
+		doomLoop := cloneDoomLoopState(*state.DoomLoop)
+		copyState.DoomLoop = &doomLoop
+	}
 	mutate(&copyState)
 	copyState.UpdatedAt = time.Now().UnixMilli()
 	return copyState
@@ -231,4 +235,22 @@ func UnsentResultsToAPIFormatWithError(results []UnsentToolResult) ([]components
 		items = append(items, components.CreateInputsUnion1FunctionCallOutputItem(item))
 	}
 	return items, nil
+}
+
+func cloneDoomLoopState(s DoomLoopSerializedState) DoomLoopSerializedState {
+	out := s
+	out.Tools = make(map[string]DoomLoopStreak, len(s.Tools))
+	for k, v := range s.Tools {
+		out.Tools[k] = v
+	}
+	if s.Text != nil {
+		text := *s.Text
+		out.Text = &text
+	}
+	if s.StopVerdict != nil {
+		v := *s.StopVerdict
+		out.StopVerdict = &v
+	}
+	out.PendingSteer = append([]string(nil), s.PendingSteer...)
+	return out
 }

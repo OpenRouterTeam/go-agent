@@ -1,9 +1,9 @@
 # Last upstream commit successfully ported AND verified AND eval-passed.
-# 680bceb ports @openrouter/agent 0.7.2 -> 0.8.0: HooksManager lifecycle
-# hooks (upstream #7/#67), versioned ConversationState serialization
-# (#66), PostModelCall telemetry + SessionEnd usage totals, default
-# final-answer directive for AllowFinalResponse (#68), and
-# awaiting_client_tools (#64). Eval verdict: PASS WITH WARNINGS — see
+# 78c562e ports the post-0.8.0 (unreleased) @openrouter/agent work:
+# doom-loop detection (upstream #73: DoomLoopMonitor, ladder incl. the
+# escalate rung, DoomLoopDetected hook, tool LoopKey, ConversationState
+# doomLoop persistence, JCS/SHA-256 fingerprints) and run-level
+# cancellation via ctx. Eval verdict: PASS WITH WARNINGS — see
 # .upstreamer/eval-report.md.
 # Only scripts/upstream runs should change this.
-upstream_commit: 680bceb4598f228d3e2ec58e2416e4335cdff059
+upstream_commit: 78c562ef53da0edd84dfbcc6d6ee38a095d72b37

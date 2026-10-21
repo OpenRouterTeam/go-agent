@@ -219,9 +219,13 @@ type ConversationState struct {
 	UnsentToolResults  []UnsentToolResult
 	PartialResponse    *PartialResponse
 	InterruptedBy      *string
-	Status             ConversationStatus
-	CreatedAt          int64
-	UpdatedAt          int64
+	// DoomLoop is the doom-loop detector state (see CallModelInput.DoomLoop),
+	// persisted so repetition streaks survive serialize → resume. nil when
+	// detection is off. Additive within ConversationStateVersion 1.
+	DoomLoop  *DoomLoopSerializedState `json:",omitempty"`
+	Status    ConversationStatus
+	CreatedAt int64
+	UpdatedAt int64
 }
 
 type StateAccessor interface {
