@@ -110,6 +110,14 @@ correct outcome for a failed port — it makes the next run retry the same delta
 instead of skipping past the gap. The workflow labels such a PR `eval-failed` and
 marks the title `do not merge`.
 
+A run that is cut off before it finishes (the `timeout_minutes` limit, default
+120, or an opencode abort) is different: the eval never completed, so it says
+nothing about parity. The workflow still commits and pushes the partial tree so
+the work is not lost, but labels the PR `port-incomplete`, never advances
+`state.yaml`, and fails the run. For a large upstream range, dispatch the
+workflow with an intermediate `ref` (one big upstream PR at a time) or a larger
+`timeout_minutes` (max 300).
+
 Never hand-edit `state.yaml` to make a run look successful.
 
 ## Running it locally

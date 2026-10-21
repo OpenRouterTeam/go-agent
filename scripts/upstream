@@ -227,9 +227,39 @@ prompt="$(cat "$prompt_file")"
 
 echo "Writing opencode log to $log_file" >&2
 
-if [ -n "${UPSTREAMER_TIMEOUT_SECONDS:-}" ]; then
-  perl -e 'alarm shift; exec @ARGV' "$UPSTREAMER_TIMEOUT_SECONDS" \
-    opencode "${model_args[@]}" "$@" run "$prompt" 2>&1 | tee "$log_file"
-else
-  opencode "${model_args[@]}" "$@" run "$prompt" 2>&1 | tee "$log_file"
+run_opencode() {
+  if [ -n "${UPSTREAMER_TIMEOUT_SECONDS:-}" ]; then
+    perl -e 'alarm shift; exec @ARGV' "$UPSTREAMER_TIMEOUT_SECONDS" \
+      opencode "${model_args[@]}" "$@" run "$prompt"
+  else
+    opencode "${model_args[@]}" "$@" run "$prompt"
+  fi
+}
+
+# Capture the converter's status instead of letting `set -e` exit on it, so the
+# outcome can be reported precisely. Exit codes the workflow relies on:
+#   0    converter finished (the eval may still have failed; state.yaml says)
+#   142  UPSTREAMER_TIMEOUT_SECONDS elapsed (SIGALRM); the tree holds partial work
+#   4    opencode exited 0 but the run ended on an error, e.g. "Tool execution
+#        aborted" (seen 2026-10-05); the tree holds partial work
+#   *    any other opencode failure, passed through
+rc=0
+run_opencode "$@" 2>&1 | tee "$log_file" || rc="${PIPESTATUS[0]}"
+
+if [ "$rc" -eq 142 ]; then
+  echo "ERROR: converter timed out after ${UPSTREAMER_TIMEOUT_SECONDS}s; the port is INCOMPLETE." >&2
+  exit 142
+elif [ "$rc" -ne 0 ]; then
+  echo "ERROR: opencode exited $rc; the port is INCOMPLETE." >&2
+  exit "$rc"
 fi
+
+# opencode exits 0 even when the session dies on an aborted or failed tool call.
+# Mid-run tool errors the agent recovers from (a failed edit it retries) are
+# normal, so only a run whose LAST output line is an error counts as aborted.
+last_line="$(sed -e 's/\x1b\[[0-9;]*m//g' "$log_file" | awk 'NF { line = $0 } END { print line }')"
+case "$last_line" in
+  Error:*)
+    echo "ERROR: opencode exited 0 but the run ended on an error ($last_line); the port is INCOMPLETE." >&2
+    exit 4 ;;
+esac
