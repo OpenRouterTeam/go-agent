@@ -32,7 +32,64 @@ func ExtractTextFromResponse(resp components.OpenResponsesResult) string {
 	return b.String()
 }
 
+// isTruncatedAtMaxOutputTokens reports whether the provider stopped resp at
+// `max_output_tokens`. The `function_call` items on such a response are an
+// unfinished batch: the model asked for the set together, and the last one
+// carries whatever argument prefix fit in the budget. Executing the complete
+// ones would hand the model a result set with a silent hole, and spend side
+// effects on a turn that truncates the same way on the same budget, so none of
+// them run. The caller sees every item and `incomplete_details`, and resumes
+// once the budget is raised.
+func isTruncatedAtMaxOutputTokens(resp components.OpenResponsesResult) bool {
+	if resp.Status != components.OpenAIResponsesResponseStatusIncomplete || resp.IncompleteDetails == nil || resp.IncompleteDetails.Reason == nil {
+		return false
+	}
+	return *resp.IncompleteDetails.Reason == components.ReasonMaxOutputTokens
+}
+
+// ExtractToolCallsFromResponse returns the parsed tool calls the loop should
+// execute for a completed response.
+//
+// A response truncated at `max_output_tokens` yields no tool calls — not even
+// the calls that completed before the cut-off (see
+// isTruncatedAtMaxOutputTokens).
 func ExtractToolCallsFromResponse(resp components.OpenResponsesResult) []ParsedToolCall {
+	if isTruncatedAtMaxOutputTokens(resp) {
+		return nil
+	}
+	return parseResponseToolCalls(resp, false)
+}
+
+// ResponseHasToolCalls reports whether resp contains any tool calls the loop
+// should execute. A response truncated at `max_output_tokens` has none, even
+// when its output carries a cut-off `function_call` item.
+//
+// Scope: this and ExtractToolCallsFromResponse decide execution on the
+// completed response. ModelResult.ToolCallsStream is a consumer view of what
+// the model emitted, so it still reports the model's calls, truncated one
+// included.
+func ResponseHasToolCalls(resp components.OpenResponsesResult) bool {
+	if isTruncatedAtMaxOutputTokens(resp) {
+		return false
+	}
+	for _, item := range resp.Output {
+		if item.OutputFunctionCallItem != nil {
+			return true
+		}
+	}
+	return false
+}
+
+// extractEmittedToolCalls returns every function_call item on resp, without
+// the truncation guard, for the consumer-facing tool-call stream. A call
+// whose arguments are not valid JSON (e.g. cut off mid-call) is still
+// reported, with the unparsed argument string as Arguments (upstream
+// buildToolCallStream).
+func extractEmittedToolCalls(resp components.OpenResponsesResult) []ParsedToolCall {
+	return parseResponseToolCalls(resp, true)
+}
+
+func parseResponseToolCalls(resp components.OpenResponsesResult, keepUnparsable bool) []ParsedToolCall {
 	var calls []ParsedToolCall
 	for _, item := range resp.Output {
 		if item.OutputFunctionCallItem == nil {
@@ -40,7 +97,7 @@ func ExtractToolCallsFromResponse(resp components.OpenResponsesResult) []ParsedT
 		}
 		fc := item.OutputFunctionCallItem
 		raw, args, err := ParseToolArguments(fc.Arguments)
-		if err != nil {
+		if err != nil && !keepUnparsable {
 			continue
 		}
 		id := fc.CallID

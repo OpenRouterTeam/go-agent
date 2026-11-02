@@ -353,3 +353,68 @@ func TestClaudeToFromRoundTripLossless(t *testing.T) {
 		t.Fatalf("GetUnsupportedContentSummary should count the carrier")
 	}
 }
+
+// Ported from upstream src/lib/chat-compat.test.ts (fromChatMessages
+// tool-call cases, upstream #11/#41).
+func TestFromChatMessagesEmitsFunctionCallItems(t *testing.T) {
+	call := ParsedToolCall{ID: "call_1", CallID: "call_1", Name: "get_weather", RawArgs: `{"city":"Austin"}`}
+
+	t.Run("null content and one tool call emits only the function_call", func(t *testing.T) {
+		items, err := FromChatMessages([]ChatMessage{{Role: "assistant", Content: nil, ToolCalls: []ParsedToolCall{call}}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(items) != 1 || items[0].FunctionCallItem == nil {
+			t.Fatalf("items = %#v", items)
+		}
+		fc := items[0].FunctionCallItem
+		if fc.CallID != "call_1" || fc.ID != "call_1" || fc.Name != "get_weather" || fc.Arguments != `{"city":"Austin"}` || fc.Status == nil || *fc.Status != components.ToolCallStatusCompleted {
+			t.Fatalf("function_call = %#v", fc)
+		}
+	})
+
+	t.Run("text and tool calls emit both, message first", func(t *testing.T) {
+		items, err := FromChatMessages([]ChatMessage{{Role: "assistant", Content: "Let me check.", ToolCalls: []ParsedToolCall{call}}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(items) != 2 || items[0].EasyInputMessage == nil || items[1].FunctionCallItem == nil {
+			t.Fatalf("items = %#v", items)
+		}
+	})
+
+	t.Run("parallel tool calls emit one item each", func(t *testing.T) {
+		second := ParsedToolCall{CallID: "call_2", Name: "get_time", Arguments: map[string]any{"tz": "UTC"}}
+		items, err := FromChatMessages([]ChatMessage{{Role: "assistant", Content: "", ToolCalls: []ParsedToolCall{call, second}}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(items) != 2 || items[0].FunctionCallItem.CallID != "call_1" || items[1].FunctionCallItem.CallID != "call_2" || items[1].FunctionCallItem.ID != "call_2" {
+			t.Fatalf("items = %#v", items)
+		}
+		if items[1].FunctionCallItem.Arguments != `{"tz":"UTC"}` {
+			t.Fatalf("structured arguments = %q", items[1].FunctionCallItem.Arguments)
+		}
+	})
+
+	t.Run("already-serialized arguments are not re-stringified", func(t *testing.T) {
+		items, _ := FromChatMessages([]ChatMessage{{Role: "assistant", ToolCalls: []ParsedToolCall{call}}})
+		if items[0].FunctionCallItem.Arguments != `{"city":"Austin"}` {
+			t.Fatalf("arguments = %q", items[0].FunctionCallItem.Arguments)
+		}
+	})
+
+	t.Run("empty assistant message with no tool calls still round-trips", func(t *testing.T) {
+		items, err := FromChatMessages([]ChatMessage{{Role: "assistant", Content: nil, ToolCalls: []ParsedToolCall{}}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(items) != 1 || items[0].EasyInputMessage == nil {
+			t.Fatalf("items = %#v", items)
+		}
+		content, _ := items[0].EasyInputMessage.Content.GetOrZero()
+		if content.Str == nil || *content.Str != "" {
+			t.Fatalf("null content must become the empty string, got %#v", content)
+		}
+	})
+}
