@@ -63,8 +63,11 @@ type ModelResult struct {
 	hooksManager        *HooksManager
 	sessionStartEmitted bool
 	sessionEndEmitted   bool
-	sessionUsage        sessionUsageAggregate
-	toolRoundsExecuted  int
+	// sessionUsage is guarded by mu: Usage(ctx) may read it while the run
+	// goroutine is still accumulating.
+	sessionUsage       sessionUsageAggregate
+	toolRoundsExecuted int
+	toolChoice         toolChoicePolicy
 }
 
 func newModelResult(ctx context.Context, client ResponseSender, input CallModelInput, req components.ResponsesRequest, state ConversationState) *ModelResult {
@@ -151,10 +154,33 @@ func CallModel(ctx context.Context, client ResponseSender, input CallModelInput)
 		tier := components.ResponsesRequestServiceTierAuto
 		req.ServiceTier = optionalnullable.From(&tier)
 	}
+	if input.ActiveTools != nil {
+		input.Tools = filterActiveTools(input.Tools, input.ActiveTools)
+	}
 	for _, t := range input.Tools {
 		req.Tools = append(req.Tools, t.ToAPITool())
 	}
 	return newModelResult(ctx, client, input, req, state), nil
+}
+
+// filterActiveTools narrows tools to the named client tools, keeping every
+// server tool (upstream callModel activeTools). Unknown names are ignored.
+func filterActiveTools(tools []Tool, active []string) []Tool {
+	set := make(map[string]struct{}, len(active))
+	for _, name := range active {
+		set[name] = struct{}{}
+	}
+	var out []Tool
+	for _, t := range tools {
+		if IsServerTool(t) {
+			out = append(out, t)
+			continue
+		}
+		if _, ok := set[t.ToolName()]; ok {
+			out = append(out, t)
+		}
+	}
+	return out
 }
 
 func inputItemsOnly(input any) ([]components.InputsUnion1, error) {
@@ -219,6 +245,11 @@ func (m *ModelResult) run() {
 	steps := []StepResult{}
 	isResume := false
 	forceResumeCount := 0
+	m.toolChoice.init(m.state.ConsumedForcedToolChoiceKey, req.ToolChoice)
+	// Persist the consumed forced-choice key with every state the run leaves
+	// behind (cleared on completion). Registered after the stream/hook
+	// defers so it runs before them, and before any StateAccessor.Save below.
+	defer m.syncToolChoiceState()
 	// An approval/HITL resume-with-decisions bypasses SessionStart/
 	// UserPromptSubmit entirely (upstream model-result.ts:2506-2515: "This
 	// path bypasses the SessionStart block below but still fires tool hooks
@@ -238,6 +269,7 @@ func (m *ModelResult) run() {
 			return
 		}
 		if paused {
+			m.syncToolChoiceState()
 			// The resume itself left calls pending (not every approved/
 			// rejected decision resolved the round) — persist the updated
 			// state before returning, mirroring upstream's
@@ -268,6 +300,24 @@ func (m *ModelResult) run() {
 				return
 			}
 		}
+		if turn == 0 {
+			// Later turns re-resolve right before their tool round executes
+			// (see resolveToolChoiceFunc call sites), so a tool-computed
+			// nextTurnParams ToolChoice still wins. The first request after an
+			// approval resume is turn 1 upstream (a continuation), not 0.
+			resolveTurn := turn
+			if isResume {
+				resolveTurn = 1
+			}
+			if err := m.resolveToolChoiceFunc(resolveTurn, &req); err != nil {
+				m.err = err
+				return
+			}
+		}
+		// A forced tool choice is relaxed to auto once it has produced a
+		// tool call, so the model can answer in text instead of being forced
+		// through tool calls until the step budget runs out (DEV-785).
+		req.ToolChoice = m.toolChoice.effective()
 		m.fullStream.Push(ResponseStreamEvent{Type: "turn.start", Turn: turn})
 		turnStartedAt := time.Now()
 		res, err := m.client.SendResponse(m.ctx, req, m.input.MetadataLevel, operations.WithSetHeaders(map[string]string{"x-openrouter-callmodel": "true"}))
@@ -296,6 +346,7 @@ func (m *ModelResult) run() {
 				turnType = ModelCallTurnTypeInitial
 			}
 		}
+		m.toolChoice.commit(ResponseHasToolCalls(resp))
 		m.emitPostModelCall(resp, turnStartedAt, turnType, turn+1)
 		text := ExtractTextFromResponse(resp)
 		if len(events) == 0 && text != "" {
@@ -303,10 +354,13 @@ func (m *ModelResult) run() {
 		}
 		m.fullStream.Push(ResponseStreamEvent{Type: "response.completed", Turn: turn, Response: &resp})
 		m.fullStream.Push(ResponseStreamEvent{Type: "turn.end", Turn: turn})
-		calls := ExtractToolCallsFromResponse(resp)
-		for _, call := range calls {
+		// The tool-call stream is a consumer view of what the model emitted
+		// (truncated calls included); execution below uses the guarded
+		// extraction, which yields nothing for a max_output_tokens cut-off.
+		for _, call := range extractEmittedToolCalls(resp) {
 			m.toolCallStream.Push(call)
 		}
+		calls := ExtractToolCallsFromResponse(resp)
 		usage := usagePtr(resp)
 		step := StepResult{Text: text, ToolCalls: calls, Response: resp, Usage: usage, FinishReason: string(resp.Status)}
 		if m.input.AfterTurn != nil {
@@ -382,6 +436,14 @@ func (m *ModelResult) run() {
 						break
 					}
 				}
+				// Resolve dynamic parameters for the next turn before this
+				// round's tools execute, so nextTurnParams computed by those
+				// tools override them (upstream resolveAsyncFunctionsForTurn
+				// precedes executeToolRound). Not reached on a pausing round.
+				if err := m.resolveToolChoiceFunc(turn+1, &req); err != nil {
+					m.err = err
+					return
+				}
 				outputs, err := m.executeToolCallsForTurn(approved, turn, &req)
 				if err != nil {
 					m.err = err
@@ -390,6 +452,12 @@ func (m *ModelResult) run() {
 				outputs = append(outputs, deniedOutputs...)
 				if isPausedStatus(m.state.Status) {
 					break
+				}
+				// Apply nextTurnParams from the executed tools so they affect
+				// the final text-coercion request (mirrors the in-loop path).
+				if err := m.applyNextTurnParams(calls, &req); err != nil {
+					m.err = err
+					return
 				}
 				finalResp, err := m.sendFinalResponseRequest(req, resp, outputs, turn+1)
 				if err != nil {
@@ -440,6 +508,10 @@ func (m *ModelResult) run() {
 				break
 			}
 		}
+		if err := m.resolveToolChoiceFunc(turn+1, &req); err != nil {
+			m.err = err
+			return
+		}
 		outputs, err := m.executeToolCallsForTurn(approved, turn, &req)
 		if err != nil {
 			m.err = err
@@ -454,6 +526,10 @@ func (m *ModelResult) run() {
 			// forceResume counter so an earlier override doesn't count
 			// against a later, independent one (mirrors upstream).
 			forceResumeCount = 0
+		}
+		if err := m.applyNextTurnParams(calls, &req); err != nil {
+			m.err = err
+			return
 		}
 		base := requestInputItems(req.Input)
 		base = append(base, responseItems...)
@@ -490,6 +566,7 @@ func (m *ModelResult) run() {
 		}
 		m.state = appendResponseItemsToState(m.state, retryResp, retryItems)
 	}
+	m.syncToolChoiceState()
 	if m.input.StateAccessor != nil {
 		if err := m.input.StateAccessor.Save(m.ctx, m.state); err != nil {
 			m.err = err
@@ -536,9 +613,19 @@ func consumeCreateResponse(res *operations.CreateResponsesResponse, onEvent func
 		if onEvent != nil {
 			onEvent(data)
 		}
-		if data.StreamEventsResponseCompleted != nil {
+		switch {
+		case data.StreamEventsResponseCompleted != nil:
 			resp := data.StreamEventsResponseCompleted.Response
 			completed = &resp
+		case data.StreamEventsResponseIncomplete != nil:
+			// An incomplete response (e.g. truncated at max_output_tokens) is
+			// still a terminal response: return it so the caller sees the
+			// items and incomplete_details (upstream consumeStreamForCompletion).
+			resp := data.StreamEventsResponseIncomplete.Response
+			completed = &resp
+		case data.StreamEventsResponseFailed != nil:
+			errJSON, _ := json.Marshal(data.StreamEventsResponseFailed.Response.Error)
+			return components.OpenResponsesResult{}, events, fmt.Errorf("response failed: %s", errJSON)
 		}
 	}
 	if err := stream.Err(); err != nil {
@@ -973,21 +1060,9 @@ func (m *ModelResult) emitSessionEndOnce(reason SessionEndReason) {
 	}
 	m.sessionEndEmitted = true
 	payload := SessionEndPayload{Reason: reason}
-	if m.sessionUsage.modelCalls > 0 {
-		totals := SessionUsageTotals{
-			ModelCallUsage: ModelCallUsage{
-				InputTokens:     m.sessionUsage.inputTokens,
-				OutputTokens:    m.sessionUsage.outputTokens,
-				TotalTokens:     m.sessionUsage.totalTokens,
-				CachedTokens:    m.sessionUsage.cachedTokens,
-				ReasoningTokens: m.sessionUsage.reasoningTokens,
-			},
-			ModelCalls: m.sessionUsage.modelCalls,
-		}
-		if m.sessionUsage.hasCost {
-			cost := m.sessionUsage.cost
-			totals.Cost = &cost
-		}
+	// SessionEnd.TotalUsage and Usage(ctx) read the same snapshot helper so
+	// they cannot drift.
+	if totals := m.usageSnapshot(); totals.ModelCalls > 0 {
 		payload.TotalUsage = &totals
 	}
 	if _, err := m.hooksManager.EmitSessionEnd(payload, m.hookEmitOptions("")); err != nil {
@@ -1011,21 +1086,11 @@ func (m *ModelResult) finishHooksSession(reason SessionEndReason) {
 // emitPostModelCall emits PostModelCall for a completed model response and
 // folds its usage into the session aggregate. One emit per materialized response.
 func (m *ModelResult) emitPostModelCall(resp components.OpenResponsesResult, startedAt time.Time, turnType ModelCallTurnType, turnNumber int) {
+	// Usage accumulates independently of the hook system, so Usage(ctx) is
+	// correct for callers who configured no hooks at all.
+	usage := m.recordModelCallUsage(resp)
 	if m.hooksManager == nil {
 		return
-	}
-	usage := extractModelCallUsage(resp)
-	m.sessionUsage.modelCalls++
-	if usage != nil {
-		m.sessionUsage.inputTokens += usage.InputTokens
-		m.sessionUsage.outputTokens += usage.OutputTokens
-		m.sessionUsage.totalTokens += usage.TotalTokens
-		m.sessionUsage.cachedTokens += usage.CachedTokens
-		m.sessionUsage.reasoningTokens += usage.ReasoningTokens
-		if usage.Cost != nil {
-			m.sessionUsage.cost += *usage.Cost
-			m.sessionUsage.hasCost = true
-		}
 	}
 	payload := PostModelCallPayload{
 		SessionID:  m.state.ID,
@@ -1255,6 +1320,7 @@ func (m *ModelResult) runToolWithHooks(t Tool, call ParsedToolCall, execCtx Tool
 	if preResult.Mutated {
 		effectiveCall.Arguments = preResult.FinalPayload.ToolInput
 		effectiveCall.RawArgs = ""
+		execCtx.Turn.ToolCall = toFunctionCallItem(effectiveCall)
 	}
 
 	startedAt := time.Now()
@@ -1525,4 +1591,284 @@ func encodeFunctionOutput(output any) (components.FunctionCallOutputItemOutputUn
 		return components.FunctionCallOutputItemOutputUnion2{}, fmt.Errorf("marshal function call output: %w", err)
 	}
 	return components.CreateFunctionCallOutputItemOutputUnion2Str(string(b)), nil
+}
+
+// recordModelCallUsage folds resp's usage into the run's aggregate and
+// returns the per-call usage (nil when resp carried none). Every
+// materialized model response counts as one model call.
+func (m *ModelResult) recordModelCallUsage(resp components.OpenResponsesResult) *ModelCallUsage {
+	usage := extractModelCallUsage(resp)
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.sessionUsage.modelCalls++
+	if usage != nil {
+		m.sessionUsage.inputTokens += usage.InputTokens
+		m.sessionUsage.outputTokens += usage.OutputTokens
+		m.sessionUsage.totalTokens += usage.TotalTokens
+		m.sessionUsage.cachedTokens += usage.CachedTokens
+		m.sessionUsage.reasoningTokens += usage.ReasoningTokens
+		if usage.Cost != nil {
+			m.sessionUsage.cost += *usage.Cost
+			m.sessionUsage.hasCost = true
+		}
+	}
+	return usage
+}
+
+// usageSnapshot returns the aggregate usage accrued so far. Cost is nil
+// unless at least one response reported a cost.
+func (m *ModelResult) usageSnapshot() SessionUsageTotals {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	totals := SessionUsageTotals{
+		ModelCallUsage: ModelCallUsage{
+			InputTokens:     m.sessionUsage.inputTokens,
+			OutputTokens:    m.sessionUsage.outputTokens,
+			TotalTokens:     m.sessionUsage.totalTokens,
+			CachedTokens:    m.sessionUsage.cachedTokens,
+			ReasoningTokens: m.sessionUsage.reasoningTokens,
+		},
+		ModelCalls: m.sessionUsage.modelCalls,
+	}
+	if m.sessionUsage.hasCost {
+		cost := m.sessionUsage.cost
+		totals.Cost = &cost
+	}
+	return totals
+}
+
+// Usage returns aggregate token/cost usage across every model call this
+// ModelResult made: the initial request, each tool-round follow-up, the
+// empty-final retry, the AllowFinalResponse final turn, and an
+// approval-resume request (upstream getUsage). Response returns only the
+// final round's response, so in a multi-round tool loop the tokens spent on
+// intermediate tool-call generations are only reachable here.
+//
+// It waits for the run to finish like Response does, so totals are final.
+// The totals are always returned — a failed run still consumed tokens — and
+// the error reports the run's failure (or ctx's, if ctx ends first, in which
+// case the totals are those accrued so far). Where upstream logs a warning
+// and never rejects, Go returns the cause as an explicit error alongside the
+// valid totals.
+func (m *ModelResult) Usage(ctx context.Context) (SessionUsageTotals, error) {
+	m.start()
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	select {
+	case <-m.done:
+		return m.usageSnapshot(), m.err
+	case <-ctx.Done():
+		return m.usageSnapshot(), ctx.Err()
+	}
+}
+
+// resolveToolChoiceFunc resolves CallModelInput.ToolChoiceFunc for the given
+// turn and records it as the caller's configured tool choice.
+func (m *ModelResult) resolveToolChoiceFunc(turn int, req *components.ResponsesRequest) error {
+	if m.input.ToolChoiceFunc == nil {
+		return nil
+	}
+	choice, err := m.input.ToolChoiceFunc(m.ctx, BuildTurnContext(nil, turn, req))
+	if err != nil {
+		return err
+	}
+	m.toolChoice.resolve(choice)
+	return nil
+}
+
+// applyNextTurnParams runs the NextTurnParams of the executed calls' tools
+// and applies the computed values to req. A tool-computed ToolChoice becomes
+// the new caller-level policy rather than a one-turn override, so the
+// forced-choice relaxation re-arms (or stays relaxed) consistently.
+func (m *ModelResult) applyNextTurnParams(calls []ParsedToolCall, req *components.ResponsesRequest) error {
+	if len(calls) == 0 || len(m.input.Tools) == 0 {
+		return nil
+	}
+	computed, err := executeToolNextTurnParams(m.ctx, calls, m.input.Tools, *req)
+	if err != nil {
+		return err
+	}
+	if len(computed) == 0 {
+		return nil
+	}
+	*req = ApplyNextTurnParamsToRequest(*req, computed)
+	if _, ok := computed["toolChoice"]; ok {
+		m.toolChoice.resolve(req.ToolChoice)
+	}
+	return nil
+}
+
+// syncToolChoiceState records the consumed forced-choice key on the run's
+// state: persisted while the run is paused, cleared once it completes so a
+// fresh conversational turn re-arms the configured choice.
+func (m *ModelResult) syncToolChoiceState() {
+	if m.state.Status == ConversationStatusComplete {
+		m.toolChoice.reset()
+		m.state.ConsumedForcedToolChoiceKey = ""
+		return
+	}
+	m.state.ConsumedForcedToolChoiceKey = m.toolChoice.consumedKey
+}
+
+// toolChoiceCommitKind is the transition a dispatch of the caller's tool
+// choice applies once its response is materialized.
+type toolChoiceCommitKind int
+
+const (
+	toolChoiceCommitNone toolChoiceCommitKind = iota
+	toolChoiceCommitClear
+	toolChoiceCommitConsume
+)
+
+// toolChoicePolicy tracks the caller-configured tool choice and whether its
+// forced value has been consumed (upstream configuredToolChoice /
+// activeConsumedForcedToolChoiceKey). A forced choice is one-shot until its
+// resolved semantic value changes: reapplying an unchanged forced choice on
+// every follow-up forbids the model from ever answering in text, while
+// suppressing a newly resolved forced value would stop callers from forcing a
+// later turn on purpose.
+type toolChoicePolicy struct {
+	configured    *components.OpenAIResponsesToolChoiceUnion
+	configuredKey string // "" when the configured choice is not forced
+	consumedKey   string // "" when no forced choice has been consumed
+	prepared      toolChoiceCommitKind
+}
+
+func (p *toolChoicePolicy) init(consumedKey string, configured *components.OpenAIResponsesToolChoiceUnion) {
+	p.consumedKey = consumedKey
+	p.resolve(configured)
+}
+
+// resolve records a freshly resolved caller choice. An unforced choice
+// prepares to clear the consumed key (re-arming a later forced value); a
+// forced choice different from the consumed one prepares to consume it.
+func (p *toolChoicePolicy) resolve(choice *components.OpenAIResponsesToolChoiceUnion) {
+	p.configured = choice
+	p.configuredKey = forcedToolChoiceKey(choice)
+	switch {
+	case p.configuredKey == "":
+		if p.consumedKey != "" {
+			p.prepared = toolChoiceCommitClear
+		} else {
+			p.prepared = toolChoiceCommitNone
+		}
+	case p.configuredKey == p.consumedKey:
+		p.prepared = toolChoiceCommitNone
+	default:
+		p.prepared = toolChoiceCommitConsume
+	}
+}
+
+// effective is the wire tool choice for the caller's next dispatch.
+func (p *toolChoicePolicy) effective() *components.OpenAIResponsesToolChoiceUnion {
+	if p.configuredKey != "" && p.configuredKey == p.consumedKey {
+		return relaxForcedToolChoice(p.configured)
+	}
+	return p.configured
+}
+
+// commit applies the prepared transition after a caller-choice dispatch
+// produced a response. A forced choice is consumed only when that response
+// actually called a tool. Engine-owned overrides (the `none` final turn and
+// the empty-final retry) never commit.
+func (p *toolChoicePolicy) commit(hasToolCalls bool) {
+	kind := p.prepared
+	p.prepared = toolChoiceCommitNone
+	switch kind {
+	case toolChoiceCommitClear:
+		p.consumedKey = ""
+	case toolChoiceCommitConsume:
+		if hasToolCalls {
+			p.consumedKey = p.configuredKey
+		}
+	}
+}
+
+// reset clears the consumed key for a terminal run exit.
+func (p *toolChoicePolicy) reset() {
+	p.consumedKey = ""
+	p.prepared = toolChoiceCommitNone
+}
+
+// isForcedToolChoice reports whether choice requires the turn to call a tool:
+// `required`, any specific-tool choice, or `allowed_tools` with mode
+// `required`.
+func isForcedToolChoice(choice *components.OpenAIResponsesToolChoiceUnion) bool {
+	if choice == nil {
+		return false
+	}
+	switch {
+	case choice.OpenAIResponsesToolChoiceRequired != nil:
+		return true
+	case choice.OpenAIResponsesToolChoiceAuto != nil, choice.OpenAIResponsesToolChoiceNone != nil:
+		return false
+	case choice.ToolChoiceAllowed != nil:
+		return choice.ToolChoiceAllowed.Mode.ModeRequired != nil
+	}
+	return true
+}
+
+// forcedToolChoiceKey is a stable identity for a concrete forced choice, or
+// "" when the choice does not force a tool call.
+func forcedToolChoiceKey(choice *components.OpenAIResponsesToolChoiceUnion) string {
+	if !isForcedToolChoice(choice) {
+		return ""
+	}
+	key, err := canonicalJSON(choice)
+	if err != nil {
+		// An unencodable choice still needs a stable non-empty identity.
+		return fmt.Sprintf("%#v", *choice)
+	}
+	return key
+}
+
+// relaxForcedToolChoice relaxes a tool choice that forces a tool call, for
+// follow-up turns after a tool round has executed (DEV-785):
+//
+//   - `required` → `auto`
+//   - a specific-tool choice → `auto`
+//   - `allowed_tools` with mode `required` → the same set with mode `auto`
+//     (the constraint on which tools may be used still applies)
+//   - `auto`, `none`, `allowed_tools` with mode `auto`, and nil pass through.
+func relaxForcedToolChoice(choice *components.OpenAIResponsesToolChoiceUnion) *components.OpenAIResponsesToolChoiceUnion {
+	if choice == nil {
+		return nil
+	}
+	switch {
+	case choice.OpenAIResponsesToolChoiceAuto != nil, choice.OpenAIResponsesToolChoiceNone != nil:
+		return choice
+	case choice.ToolChoiceAllowed != nil:
+		if choice.ToolChoiceAllowed.Mode.ModeRequired == nil {
+			return choice
+		}
+		relaxed := *choice.ToolChoiceAllowed
+		relaxed.Mode = components.CreateModeModeAuto(components.ModeAutoAuto)
+		out := components.CreateOpenAIResponsesToolChoiceUnionToolChoiceAllowed(relaxed)
+		return &out
+	}
+	auto := components.CreateOpenAIResponsesToolChoiceUnionOpenAIResponsesToolChoiceAuto(components.OpenAIResponsesToolChoiceAutoAuto)
+	return &auto
+}
+
+// canonicalJSON encodes v as canonical JSON: object keys sorted, no
+// insignificant whitespace, no HTML escaping — the RFC 8785 (JCS) form for
+// the string/object/array values tool choices are made of, so persisted keys
+// match the other ports' canonicalizeKeyMaterial output.
+func canonicalJSON(v any) (string, error) {
+	b, err := json.Marshal(v)
+	if err != nil {
+		return "", err
+	}
+	var generic any
+	if err := json.Unmarshal(b, &generic); err != nil {
+		return "", err
+	}
+	var buf strings.Builder
+	enc := json.NewEncoder(&buf)
+	enc.SetEscapeHTML(false)
+	if err := enc.Encode(generic); err != nil {
+		return "", err
+	}
+	return strings.TrimSuffix(buf.String(), "\n"), nil
 }

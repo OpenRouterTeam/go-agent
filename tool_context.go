@@ -1,6 +1,11 @@
 package agent
 
-import "sync"
+import (
+	"encoding/json"
+	"sync"
+
+	"github.com/OpenRouterTeam/go-sdk/models/components"
+)
 
 const SharedContextKey = "shared"
 
@@ -62,7 +67,39 @@ func BuildToolExecuteContext(call ParsedToolCall, turn TurnContext, store *ToolC
 		local = store.Get(call.Name)
 		shared = store.Get(SharedContextKey)
 	}
+	// The executed call is part of the tool-facing turn context. A
+	// caller-provided turn.ToolCall still wins; otherwise the executed call
+	// is converted back to its wire-shaped function_call item, so the
+	// streaming loop's tools see the same TurnContext.ToolCall the
+	// orchestrator's do (upstream #91).
+	if turn.ToolCall == nil && (call.Name != "" || call.CallID != "" || call.ID != "") {
+		turn.ToolCall = toFunctionCallItem(call)
+	}
 	return ToolExecuteContext{ToolCall: call, Turn: turn, Context: local, Shared: shared, Store: store, Emit: emit}
+}
+
+// toFunctionCallItem converts a parsed call back to its wire-shaped
+// function_call item.
+func toFunctionCallItem(call ParsedToolCall) *components.OutputFunctionCallItem {
+	id := callKey(call)
+	callID := call.CallID
+	if callID == "" {
+		callID = id
+	}
+	args := call.RawArgs
+	if args == "" {
+		args = "{}"
+		if call.Arguments != nil {
+			if b, err := json.Marshal(call.Arguments); err == nil {
+				args = string(b)
+			}
+		}
+	}
+	item := &components.OutputFunctionCallItem{CallID: callID, Name: call.Name, Arguments: args, Type: components.OutputFunctionCallItemTypeFunctionCall}
+	if id != "" {
+		item.ID = &id
+	}
+	return item
 }
 
 func (tc ToolExecuteContext) LocalContext() map[string]any {

@@ -94,12 +94,45 @@ func ValidateAgainstSchema(raw json.RawMessage, schema map[string]any) error {
 	if err := json.Unmarshal(raw, &value); err != nil {
 		return err
 	}
-	return validateValue(value, schema, "$", true)
+	return validateValueWithRoot(value, schema, schema, "$", true)
 }
 
 func validateValue(value any, schema map[string]any, path string, requireRequired bool) error {
+	return validateValueWithRoot(value, schema, schema, path, requireRequired)
+}
+
+// resolveLocalRef follows a document-local `$ref` (`#/$defs/Name` or
+// `#/definitions/Name`, the shapes invopop/jsonschema reflection emits for
+// struct-derived tool schemas) against root. Unresolvable refs return nil so
+// validation stays permissive at the dynamic JSON boundary.
+func resolveLocalRef(ref string, root map[string]any) map[string]any {
+	for _, prefix := range []string{"#/$defs/", "#/definitions/"} {
+		if strings.HasPrefix(ref, prefix) {
+			defs, _ := root[strings.TrimSuffix(strings.TrimPrefix(prefix, "#/"), "/")].(map[string]any)
+			target, _ := defs[strings.TrimPrefix(ref, prefix)].(map[string]any)
+			return target
+		}
+	}
+	return nil
+}
+
+func validateValueWithRoot(value any, schema, root map[string]any, path string, requireRequired bool) error {
 	if schema == nil {
 		return nil
+	}
+	// Follow local refs (bounded to guard against cyclic definitions) so a
+	// struct-derived schema's required fields and property types are
+	// actually enforced, as the advertised wire schema promises.
+	for depth := 0; depth < 32; depth++ {
+		ref, ok := schema["$ref"].(string)
+		if !ok {
+			break
+		}
+		target := resolveLocalRef(ref, root)
+		if target == nil {
+			break
+		}
+		schema = target
 	}
 	if typ, _ := schema["type"].(string); typ != "" {
 		switch typ {
@@ -122,7 +155,7 @@ func validateValue(value any, schema map[string]any, path string, requireRequire
 			for k, prop := range props {
 				if child, exists := m[k]; exists {
 					if propMap, ok := prop.(map[string]any); ok {
-						if err := validateValue(child, propMap, path+"."+k, true); err != nil {
+						if err := validateValueWithRoot(child, propMap, root, path+"."+k, true); err != nil {
 							return err
 						}
 					}
@@ -152,7 +185,7 @@ func validateValue(value any, schema map[string]any, path string, requireRequire
 			}
 			if itemSchema, ok := schema["items"].(map[string]any); ok {
 				for i, child := range arr {
-					if err := validateValue(child, itemSchema, fmt.Sprintf("%s[%d]", path, i), true); err != nil {
+					if err := validateValueWithRoot(child, itemSchema, root, fmt.Sprintf("%s[%d]", path, i), true); err != nil {
 						return err
 					}
 				}

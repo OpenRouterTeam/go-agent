@@ -1,6 +1,101 @@
 # go-agent Changelog
 
-## Unreleased
+## Unreleased — partial sync toward `@openrouter/agent` 0.9–0.11
+
+This release ports the tool-loop fixes and smaller features from
+`@openrouter/agent` 0.9.0 through 0.11.0 (plus later unreleased fixes). It does
+**not** yet match 0.11.0 as a whole: see "Not yet ported" below.
+
+- Tool calls from a response truncated at `max_output_tokens` are no longer
+  executed — not even the calls in the same batch that completed before the
+  cut-off. The run finalizes on that turn (`Response` has
+  `status: "incomplete"` and `incomplete_details.reason: "max_output_tokens"`)
+  instead of running a cut-off call and re-requesting on the same exhausted
+  budget. Raise the budget and re-request to continue. `ToolCallsStream` still
+  reports every call the model emitted, including the truncated one (with its
+  unparsed argument string). New helper: `ResponseHasToolCalls`.
+- A streamed turn that ends with `response.incomplete` now resolves to that
+  incomplete response instead of failing with "stream ended without
+  response.completed", and a `response.failed` event now surfaces as a
+  `response failed: …` error on every consumer.
+- `FromChatMessages`: an assistant message with no content and tool calls now
+  emits only its `function_call` items (previously an empty assistant message
+  was emitted too). Each `function_call` carries the call id as both `id` and
+  `call_id` (falling back to `ID` when `CallID` is empty) and
+  `status: "completed"`. A `nil` message content becomes `""`.
+- Added `ToolConfig.WireInputSchema` for manual tools: a caller-owned JSON
+  Schema (including `anyOf`/`oneOf`) sent as the wire tool's `parameters`,
+  copied and stripped of `~`-prefixed keys. Ignored for executable tools.
+- Added `ToolConfig.Strict`, forwarded as the wire tool's `strict` flag.
+  **Behavior change:** tools previously always sent `strict: true`; an unset
+  `Strict` now sends `strict: null` (provider default), matching the
+  TypeScript SDK. Set `Strict: &true` to keep the old behavior. OpenAI-style
+  strict schemas require every object property to be listed in `required`.
+- Added per-tool `ToolConfig.NextTurnParams` (`NextTurnParams[In]`): typed
+  functions that set `Input`, `ToolChoice`, `Model`, `Models`, `Temperature`,
+  `MaxOutputTokens`, `TopP`, `TopK`, or `Instructions` for the turn after the
+  tool runs, composing across tools (Tools-slice order) and calls. Applied
+  after each tool round, including before the `AllowFinalResponse` final
+  turn (not on an approval/rejection resume, matching upstream). A
+  tool-computed
+  `ToolChoice` (e.g. a tool-search tool widening an `allowed_tools` set)
+  becomes the new caller policy and leaves `tools` byte-identical so the
+  prompt-cache prefix survives. Compatibility note: computed values stay in
+  effect for later turns; TypeScript re-resolves every function-valued
+  `callModel` parameter per turn, which can revert them, while Go re-resolves
+  only `ToolChoiceFunc` per turn (`ModelFunc`/`InstructionsFunc` resolve
+  once). `NextTurnParamsContext` gains the upstream
+  fields, and `ApplyNextTurnParamsToRequest` now applies every key
+  (previously only `model`); `ExecuteNextTurnParamsFunctions` evaluates keys in
+  the upstream order and skips unknown keys with a warning.
+- A forced tool choice (`required`, a specific tool, or `allowed_tools` with
+  mode `required`) is now relaxed to `auto` (or `allowed_tools` mode `auto`,
+  same set) on follow-up turns once it has produced a tool call, so the model
+  can answer in text instead of being forced through tools until the step
+  budget runs out. This holds across approval, HITL, and client-tool pauses
+  via the new additive `ConversationState.ConsumedForcedToolChoiceKey`, which
+  is cleared when the run completes. New `CallModelInput.ToolChoiceFunc`
+  resolves the choice per turn; a choice that resolves to a different value
+  re-arms. `ToolChoiceFunc` is resolved before a round's tools run, so a
+  tool's `NextTurnParams.ToolChoice` overrides it for the next request. The
+  forced final (`none`) turn is unchanged.
+- Added `ModelResult.Usage(ctx)`: aggregate token/cost totals
+  (`SessionUsageTotals`) across every model call of the run — initial
+  request, tool rounds, the final and retry turns, and approval resumes —
+  accumulated whether or not hooks are configured. `SessionEnd.TotalUsage`
+  reads the same snapshot. Compatibility note: where TypeScript's `getUsage()`
+  never rejects and logs a warning on failure, Go always returns the totals
+  accrued so far **and** the run's error (or `ctx`'s) as an explicit second
+  return value.
+- Added `CallModelInput.ActiveTools`: narrows `Tools` to the named client
+  tools for both the request and execution (server tools are always kept;
+  unknown names are ignored). If nothing remains, `tools` is omitted from the
+  request instead of being sent as an empty array.
+- Generator tools no longer accumulate their yields on the result:
+  `ToolExecutionResult.Events` is kept for compatibility but is no longer
+  populated. Yields are still delivered live as `tool.preliminary` events on
+  `ToolStream`.
+- A tool's `ToolExecuteContext.Turn.ToolCall` is now populated with the
+  executed call (as a wire-shaped `function_call` item, reflecting any
+  `PreToolUse` input mutation) on the `CallModel` loop path; a caller-supplied
+  `TurnContext.ToolCall` still wins.
+- A tool-level `Approval` predicate now fails closed: when a call's arguments
+  fail the tool's own input decoding/validation (the checks `Execute` applies)
+  or are not a JSON object, approval is required and the predicate is not
+  called. Call-level `CallModelInput.Approval` checks are unchanged and still
+  receive the call's raw (JSON-decoded) arguments; upstream passes a
+  schema-normalized copy, which only differs when a Zod schema applies
+  defaults/coercions — Go struct decoding has no such step.
+- Tool input validation now follows the `$ref`/`$defs` structure that
+  struct-derived schemas (`NewTool[T]` without an explicit `InputSchema`)
+  are generated with. **Behavior change:** a model call that omits a field
+  the advertised schema marks `required` (any field without `omitempty` or
+  marked `jsonschema:"required"`), or sends a wrongly typed nested value, now
+  produces a validation-error tool output instead of executing with the Go
+  zero value — matching the TypeScript SDK, which rejects such input. Mark
+  optional fields `omitempty` to keep them optional.
+
+### Test and CI hardening
 
 - Fixed a possible nil-pointer dereference in the `AllowFinalResponse` test path
   and lower-cased the `stop hook: …` wrapped error string to follow Go
@@ -11,6 +106,22 @@
   coverage are now enforced gates, and `ToolEventBroadcaster` plus the
   `stream_guards.go` predicates are now used by the streaming loop instead of
   sitting alongside duplicate inline logic.
+
+### Not yet ported from `@openrouter/agent` 0.9–0.11
+
+These upstream features have no Go equivalent yet; code relying on them will
+not port directly:
+
+- Doom-loop detection (`doomLoop`, the `DoomLoopDetected` hook, escalation).
+- Async tool lifecycles (`lifecycle: 'background' | 'deferred'`), the
+  universal `task` tool, steering, `tool.agent()` subagents, per-tool
+  timeouts/cancellation, and tool concurrency limits.
+- The tool-set helpers (`@openrouter/agent/tool-set`); only `ActiveTools` is
+  available.
+- The MCP integration (`@openrouter/agent/mcp`).
+- Opt-in stream replay compaction (`streamReplay`).
+- Running `PreToolUse` before the approval gate (so approval decides on
+  hook-mutated arguments); in Go, `PreToolUse` still runs at execution time.
 
 ## Lifecycle Hooks, Versioned State, And 0.8.0 Parity (ported from `@openrouter/agent@0.8.0`)
 
@@ -97,6 +208,14 @@
 | `markMcp(tool)` / `isMcpTool(tool)` | `MarkMcp(tool) Tool` / `IsMcpTool(tool) bool` |
 | tool result / stream event `source` | `Source ToolSource` (`ToolSourceClient` / `ToolSourceMCP`) on `ToolExecutionResult`, `ToolStreamEvent`, `ToolResultEvent` |
 | `awaiting_client_tools` | `ConversationStatusAwaitingClientTools` |
+| `result.getUsage()` | `result.Usage(ctx) (SessionUsageTotals, error)` |
+| tool `nextTurnParams: { toolChoice, model, … }` | `ToolConfig[T].NextTurnParams *NextTurnParams[T]` (typed function fields) |
+| tool `wireInputSchema` | `ToolConfig[T].WireInputSchema map[string]any` |
+| tool `strict` | `ToolConfig[T].Strict *bool` |
+| `activeTools` | `ActiveTools []string` on `CallModelInput` |
+| function-valued `toolChoice` | `ToolChoiceFunc` on `CallModelInput` |
+| `responseHasToolCalls(response)` | `ResponseHasToolCalls(resp) bool` |
+| state `consumedForcedToolChoiceKey` | `ConversationState.ConsumedForcedToolChoiceKey` |
 
 ## Compatibility Notes
 

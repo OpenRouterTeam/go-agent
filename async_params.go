@@ -9,10 +9,22 @@ import (
 type DynamicValue[T any] func(context.Context, TurnContext) (T, error)
 
 type CallModelInput struct {
-	Model              string
-	ModelFunc          DynamicValue[string]
-	Input              any
-	Tools              []Tool
+	Model     string
+	ModelFunc DynamicValue[string]
+	Input     any
+	Tools     []Tool
+	// ActiveTools, when non-nil, narrows Tools to the named client tools
+	// before they are sent to the model or registered for execution. Server
+	// tools are always kept; unknown names are ignored. When the filter (or
+	// an empty Tools slice) leaves no tools, the request omits `tools`
+	// entirely rather than sending an empty array.
+	ActiveTools []string
+	// ToolChoiceFunc, when set, resolves the caller's tool choice per turn
+	// (overriding Request.ToolChoice). A forced choice (`required`, a
+	// specific tool, or `allowed_tools` with mode `required`) is relaxed to
+	// `auto` on follow-up turns once it has produced a tool call; a choice
+	// that resolves to a different semantic value re-arms.
+	ToolChoiceFunc     DynamicValue[*components.OpenAIResponsesToolChoiceUnion]
 	StopWhen           []StopCondition
 	AllowFinalResponse any
 	// StrictFinalResponse: when true, skips the one-shot retry that would
@@ -47,7 +59,7 @@ type CallModelInputWithState = CallModelInput
 type ResolvedCallModelInput = CallModelInput
 
 func HasAsyncFunctions(input CallModelInput) bool {
-	return input.ModelFunc != nil || input.InstructionsFunc != nil
+	return input.ModelFunc != nil || input.InstructionsFunc != nil || input.ToolChoiceFunc != nil
 }
 
 func ResolveAsyncFunctions(ctx context.Context, input CallModelInput, turn TurnContext) (ResolvedCallModelInput, error) {

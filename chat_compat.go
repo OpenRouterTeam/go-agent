@@ -36,11 +36,22 @@ func FromChatMessages(messages []ChatMessage) ([]components.InputsUnion1, error)
 			out = append(out, components.CreateInputsUnion1FunctionCallOutputItem(components.FunctionCallOutputItem{CallID: m.ToolCallID, Output: components.CreateFunctionCallOutputItemOutputUnion2Str(result), Type: components.FunctionCallOutputItemTypeFunctionCallOutputFunctionCallOutput}))
 			continue
 		}
-		if text, ok := m.Content.(string); ok {
-			out = append(out, easyMessage(m.Role, components.CreateEasyInputMessageContentUnion2Str(text)))
-		} else {
-			out = append(out, easyMessage(m.Role, components.CreateEasyInputMessageContentUnion2Any(m.Content)))
+		// Skip the assistant message item only when it has no content AND
+		// tool calls are emitted in its place. A content-less assistant
+		// message with no tool calls still round-trips as an empty message
+		// rather than disappearing (upstream fromChatMessages).
+		emptyAssistant := m.Role == "assistant" && isEmptyChatContent(m.Content)
+		if !emptyAssistant || len(m.ToolCalls) == 0 {
+			if text, ok := m.Content.(string); ok {
+				out = append(out, easyMessage(m.Role, components.CreateEasyInputMessageContentUnion2Str(text)))
+			} else if m.Content == nil {
+				out = append(out, easyMessage(m.Role, components.CreateEasyInputMessageContentUnion2Str("")))
+			} else {
+				out = append(out, easyMessage(m.Role, components.CreateEasyInputMessageContentUnion2Any(m.Content)))
+			}
 		}
+		// One function_call item per tool call, carrying the call id as both
+		// id and call_id. Already-serialized arguments are forwarded as-is.
 		for _, call := range m.ToolCalls {
 			args := call.RawArgs
 			if args == "" && call.Arguments != nil {
@@ -50,7 +61,12 @@ func FromChatMessages(messages []ChatMessage) ([]components.InputsUnion1, error)
 				}
 				args = string(b)
 			}
-			out = append(out, components.CreateInputsUnion1FunctionCallItem(components.FunctionCallItem{ID: callKey(call), CallID: call.CallID, Name: call.Name, Arguments: args, Type: components.FunctionCallItemTypeFunctionCall}))
+			callID := call.CallID
+			if callID == "" {
+				callID = call.ID
+			}
+			status := components.ToolCallStatusCompleted
+			out = append(out, components.CreateInputsUnion1FunctionCallItem(components.FunctionCallItem{ID: callID, CallID: callID, Name: call.Name, Arguments: args, Status: &status, Type: components.FunctionCallItemTypeFunctionCall}))
 		}
 	}
 	return out, nil
@@ -70,4 +86,14 @@ func contentToStringWithError(content any) (string, error) {
 		return "", fmt.Errorf("marshal content: %w", err)
 	}
 	return string(b), nil
+}
+
+// isEmptyChatContent reports whether a chat message's content renders to the
+// empty string (nil or "").
+func isEmptyChatContent(content any) bool {
+	if content == nil {
+		return true
+	}
+	s, ok := content.(string)
+	return ok && s == ""
 }

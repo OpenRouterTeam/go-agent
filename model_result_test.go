@@ -13,11 +13,17 @@ type fakeSender struct {
 	responses []*operations.CreateResponsesResponse
 	requests  []components.ResponsesRequest
 	calls     int
+	// err, when set, is returned by every SendResponse call (a transport
+	// failure before any response materializes).
+	err error
 }
 
 func (f *fakeSender) SendResponse(ctx context.Context, req components.ResponsesRequest, metadata *components.MetadataLevel, opts ...operations.Option) (*operations.CreateResponsesResponse, error) {
 	f.calls++
 	f.requests = append(f.requests, req)
+	if f.err != nil {
+		return nil, f.err
+	}
 	if f.calls > len(f.responses) {
 		return f.responses[len(f.responses)-1], nil
 	}

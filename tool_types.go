@@ -140,6 +140,9 @@ type ToolExecutionResult struct {
 	Source ToolSource
 	Output any
 	Error  error
+	// Events is kept for compatibility and is no longer populated: generator
+	// yields are broadcast live (tool.preliminary events on ToolStream) but
+	// not accumulated on the terminal result.
 	Events []any
 }
 
@@ -215,13 +218,20 @@ type ConversationState struct {
 	ID                 string
 	Messages           []components.InputsUnion1
 	PreviousResponseID *string
-	PendingToolCalls   []ParsedToolCall
-	UnsentToolResults  []UnsentToolResult
-	PartialResponse    *PartialResponse
-	InterruptedBy      *string
-	Status             ConversationStatus
-	CreatedAt          int64
-	UpdatedAt          int64
+	// ConsumedForcedToolChoiceKey is the canonical (RFC 8785-style) key of
+	// the forced tool choice most recently consumed by the active logical
+	// run. Persisted across approval, HITL, and client-tool pauses so an
+	// unchanged forced choice stays relaxed after resume while a newly
+	// resolved forced value can re-arm. Cleared when the run completes.
+	// Additive within ConversationStateVersion 1.
+	ConsumedForcedToolChoiceKey string `json:",omitempty"`
+	PendingToolCalls            []ParsedToolCall
+	UnsentToolResults           []UnsentToolResult
+	PartialResponse             *PartialResponse
+	InterruptedBy               *string
+	Status                      ConversationStatus
+	CreatedAt                   int64
+	UpdatedAt                   int64
 }
 
 type StateAccessor interface {
