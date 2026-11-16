@@ -4,7 +4,9 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"reflect"
+	"time"
 
 	openrouter "github.com/OpenRouterTeam/go-sdk"
 	"github.com/OpenRouterTeam/go-sdk/models/components"
@@ -27,6 +29,37 @@ type ToolConfig[In any] struct {
 	Approval           ToolApprovalCheck
 	OnToolCalled       func(context.Context, In, ToolExecuteContext) (any, bool, error)
 	OnResponseReceived func(context.Context, any, ToolExecuteContext) (any, error)
+	// Strict is serialized onto the wire function definition: whether the
+	// provider should enforce strict schema adherence when generating this
+	// tool's call arguments. nil leaves the provider default (the field is
+	// omitted). OpenAI-style strict mode requires every declared property to
+	// be listed in `required`; the schema is forwarded unchanged.
+	Strict *bool
+	// WireInputSchema is a caller-owned JSON Schema serialized to the model
+	// verbatim (sanitized of `~`-prefixed keys) instead of the schema derived
+	// from In / InputSchema. Only valid on manual tools (no Execute, Generate
+	// or OnToolCalled); NewTool returns an error otherwise. A schema whose
+	// root is not an object is ignored in favor of the derived schema.
+	WireInputSchema map[string]any
+	// ToModelOutput maps a successful execution result to the content sent
+	// to the model in place of the JSON-encoded output. It receives the
+	// decoded input the tool ran on. Applied on every result path: the
+	// normal tool round, auto-approved siblings of an approval pause, and
+	// calls approved on resume.
+	ToModelOutput func(ctx context.Context, input In, output any) (ToModelOutputResult, error)
+	// NextTurnParams computes request parameters for the next model turn
+	// after a call to this tool succeeds. See NextTurnParamsFunctions.
+	NextTurnParams NextTurnParamsFunctions
+	// Timeout bounds one execution of this tool; it overrides
+	// CallModelInput.ToolTimeout. On expiry the model receives a
+	// *ToolTimeoutError output and the loop continues. Zero means no
+	// per-tool deadline.
+	Timeout time.Duration
+	// LoopKey declares this tool's doom-loop identity (upstream `loopKey`),
+	// used only when CallModelInput.DoomLoop is set. nil means the full
+	// call arguments are the identity; ExemptToolLoopKey exempts the tool;
+	// LoopKeyFields builds the field-subset form. See ToolLoopKey.
+	LoopKey ToolLoopKey
 }
 
 type TypedTool[In any] struct {
@@ -40,6 +73,9 @@ func NewTool[In any](config ToolConfig[In]) (*TypedTool[In], error) {
 	}
 	if config.Name == "" {
 		return nil, errors.New("tool name is required")
+	}
+	if config.WireInputSchema != nil && (config.Execute != nil || config.Generate != nil || config.OnToolCalled != nil) {
+		return nil, fmt.Errorf("tool %q: WireInputSchema is only supported on manual tools", config.Name)
 	}
 	t := &TypedTool[In]{config: config}
 	if config.InputSchema != nil {
@@ -97,28 +133,114 @@ func (t *TypedTool[In]) HandleResponseReceived(ctx context.Context, output any, 
 }
 
 func (t *TypedTool[In]) ToAPITool() components.ResponsesRequestToolUnion {
+	return functionToolDefinition(t.config.Name, t.config.Description, t.InputSchema(), t.config.WireInputSchema, t.config.Strict)
+}
+
+// functionToolDefinition builds the wire function tool. wire, when its root
+// is an object schema, is serialized (sanitized) instead of schema.
+func functionToolDefinition(name, description string, schema, wire map[string]any, strict *bool) components.ResponsesRequestToolUnion {
+	params := schema
+	if wire != nil && isObjectRootSchema(wire) {
+		params = SanitizeSchema(wire)
+	}
 	fn := components.ResponsesRequestToolFunction{
-		Name:       t.config.Name,
-		Parameters: t.InputSchema(),
+		Name:       name,
+		Parameters: params,
 		Type:       components.ResponsesRequestTypeFunction,
 	}
-	if t.config.Description != "" {
-		fn.Description = optionalnullable.From(openrouter.String(t.config.Description))
+	if description != "" {
+		fn.Description = optionalnullable.From(openrouter.String(description))
 	}
-	strict := true
-	fn.Strict = optionalnullable.From(&strict)
+	if strict != nil {
+		v := *strict
+		fn.Strict = optionalnullable.From(&v)
+	}
 	return components.CreateResponsesRequestToolUnionFunction(fn)
 }
 
-func (t *TypedTool[In]) Execute(ctx context.Context, raw json.RawMessage, execCtx ToolExecuteContext) (ToolExecutionResult, error) {
+func isObjectRootSchema(schema map[string]any) bool {
+	typ, ok := schema["type"]
+	if !ok {
+		return false
+	}
+	return typ == "object"
+}
+
+// decodeInput decodes raw tool arguments into In, mirroring Execute's
+// parse + schema validation.
+func (t *TypedTool[In]) decodeInput(raw json.RawMessage) (In, error) {
 	var input In
 	if len(raw) == 0 || string(raw) == "null" {
 		raw = []byte("{}")
 	}
 	if err := json.Unmarshal(raw, &input); err != nil {
-		return ToolExecutionResult{CallID: execCtx.ToolCall.CallID, Name: t.config.Name, Error: err}, nil
+		return input, err
 	}
 	if err := ValidateAgainstSchema(raw, t.schema); err != nil {
+		return input, err
+	}
+	return input, nil
+}
+
+// normalizeArguments returns the arguments exactly as Execute would receive
+// them (decoded into In and re-encoded), so approval predicates decide on
+// the same values the tool body sees. ok is false when the arguments fail
+// to decode/validate or the decoded value is not a JSON object.
+func (t *TypedTool[In]) normalizeArguments(raw json.RawMessage) (map[string]any, bool) {
+	input, err := t.decodeInput(raw)
+	if err != nil {
+		return nil, false
+	}
+	b, err := json.Marshal(input)
+	if err != nil {
+		return nil, false
+	}
+	var out map[string]any
+	if err := json.Unmarshal(b, &out); err != nil || out == nil {
+		return nil, false
+	}
+	return out, true
+}
+
+func (t *TypedTool[In]) hasApprovalPredicate() bool { return t.config.Approval != nil }
+
+func (t *TypedTool[In]) hasBlanketApproval() bool {
+	return t.config.Approval == nil && t.config.RequireApproval
+}
+
+func (t *TypedTool[In]) nextTurnParams() NextTurnParamsFunctions { return t.config.NextTurnParams }
+
+func (t *TypedTool[In]) timeout() time.Duration { return t.config.Timeout }
+
+func (t *TypedTool[In]) loopKey() ToolLoopKey { return t.config.LoopKey }
+
+// modelOutput applies ToModelOutput. ok is false when the tool has no
+// mapper, in which case the raw output is used unchanged.
+func (t *TypedTool[In]) modelOutput(ctx context.Context, call ParsedToolCall, output any) (any, bool, error) {
+	if t.config.ToModelOutput == nil {
+		return nil, false, nil
+	}
+	raw, err := callArgumentsJSON(call)
+	if err != nil {
+		return nil, false, err
+	}
+	input, err := t.decodeInput(raw)
+	if err != nil {
+		return nil, false, fmt.Errorf("toModelOutput input for %q: %w", call.Name, err)
+	}
+	res, err := t.config.ToModelOutput(ctx, input, output)
+	if err != nil {
+		return nil, false, fmt.Errorf("toModelOutput for %q: %w", call.Name, err)
+	}
+	if res.Type == "content" {
+		return append([]ToolOutputContentItem{}, res.Value...), true, nil
+	}
+	return nil, false, nil
+}
+
+func (t *TypedTool[In]) Execute(ctx context.Context, raw json.RawMessage, execCtx ToolExecuteContext) (ToolExecutionResult, error) {
+	input, err := t.decodeInput(raw)
+	if err != nil {
 		return ToolExecutionResult{CallID: execCtx.ToolCall.CallID, Name: t.config.Name, Error: err}, nil
 	}
 	if t.config.OnToolCalled != nil {
@@ -135,24 +257,25 @@ func (t *TypedTool[In]) Execute(ctx context.Context, raw json.RawMessage, execCt
 		return ToolExecutionResult{CallID: execCtx.ToolCall.CallID, Name: t.config.Name, Output: out}, nil
 	}
 	if t.config.Generate != nil {
-		var events []any
+		// Yields are broadcast live through execCtx.Emit and not retained:
+		// a long-running generator must not accumulate its whole yield
+		// history on the result (upstream 1.0 dropped preliminaryResults).
 		out, err := t.config.Generate(ctx, input, execCtx, func(v any) error {
 			if err := validateAny(v, t.config.EventSchema); err != nil {
 				return err
 			}
-			events = append(events, v)
 			if execCtx.Emit != nil {
 				execCtx.Emit(v)
 			}
 			return nil
 		})
 		if err != nil {
-			return ToolExecutionResult{CallID: execCtx.ToolCall.CallID, Name: t.config.Name, Events: events, Error: err}, nil
+			return ToolExecutionResult{CallID: execCtx.ToolCall.CallID, Name: t.config.Name, Error: err}, nil
 		}
 		if err := t.validateOutput(out); err != nil {
-			return ToolExecutionResult{CallID: execCtx.ToolCall.CallID, Name: t.config.Name, Output: out, Events: events, Error: err}, nil
+			return ToolExecutionResult{CallID: execCtx.ToolCall.CallID, Name: t.config.Name, Output: out, Error: err}, nil
 		}
-		return ToolExecutionResult{CallID: execCtx.ToolCall.CallID, Name: t.config.Name, Output: out, Events: events}, nil
+		return ToolExecutionResult{CallID: execCtx.ToolCall.CallID, Name: t.config.Name, Output: out}, nil
 	}
 	if t.config.Execute == nil {
 		return ToolExecutionResult{CallID: execCtx.ToolCall.CallID, Name: t.config.Name, Error: ErrManualTool}, nil
@@ -183,12 +306,56 @@ func validateAny(v any, schema map[string]any) error {
 type ServerToolConfig struct {
 	Name   string
 	Config components.ResponsesRequestToolUnion
+	// ID is the server tool's identity for tool-set activation and
+	// ActiveTools filtering. Empty means the upstream default
+	// "server:<type>", where <type> is the wire `type` of Config.
+	ID string
 }
 
 type serverToolImpl struct{ config ServerToolConfig }
 
 func NewServerTool(config ServerToolConfig) Tool {
 	return serverToolImpl{config: config}
+}
+
+// ServerToolID returns the configured ID, or "server:<type>" by default.
+func (s serverToolImpl) ServerToolID() string {
+	if s.config.ID != "" {
+		return s.config.ID
+	}
+	return "server:" + serverToolWireType(s.config.Config)
+}
+
+// serverToolWireType reads the `type` discriminator of a server tool's wire
+// config.
+func serverToolWireType(cfg components.ResponsesRequestToolUnion) string {
+	b, err := json.Marshal(cfg)
+	if err != nil {
+		return ""
+	}
+	var probe struct {
+		Type string `json:"type"`
+	}
+	if err := json.Unmarshal(b, &probe); err != nil {
+		return ""
+	}
+	return probe.Type
+}
+
+// ToolID returns the identity used by tool sets and CallModelInput.ActiveTools:
+// a client tool's name, or a server tool's ID ("server:<type>" unless
+// overridden by ServerToolConfig.ID).
+func ToolID(t Tool) string {
+	if t == nil {
+		return ""
+	}
+	if s, ok := t.(interface{ ServerToolID() string }); ok {
+		return s.ServerToolID()
+	}
+	if IsServerTool(t) {
+		return "server:" + serverToolWireType(t.ToAPITool())
+	}
+	return t.ToolName()
 }
 
 func (s serverToolImpl) ToolName() string             { return s.config.Name }
@@ -207,7 +374,12 @@ func (s serverToolImpl) ToAPITool() components.ResponsesRequestToolUnion { retur
 
 func schemaFor[T any]() (map[string]any, error) {
 	var zero T
-	s := jsonschema.Reflect(zero)
+	// ExpandedStruct inlines the root type so the tool's parameters are a
+	// plain object schema (not a bare {"$ref": ...}); nested named types stay
+	// under $defs and are resolved by the validator.
+	rt := reflect.TypeOf(zero)
+	r := &jsonschema.Reflector{ExpandedStruct: rt != nil && rt.Kind() == reflect.Struct && rt.Name() != ""}
+	s := r.Reflect(zero)
 	b, err := json.Marshal(s)
 	if err != nil {
 		return nil, err
@@ -254,9 +426,28 @@ func deepCopyJSONValue(v any) any {
 // unmarked tool. Execute is forwarded explicitly (rather than inherited via
 // embedding, which only promotes the narrow Tool interface) so a marked
 // executable tool keeps executing normally.
-type mcpBrand struct{ Tool }
+type mcpBrand struct {
+	Tool
+	wireInputSchema map[string]any
+	// loopKey, when set via McpMarkOptions.LoopKey, overrides the wrapped
+	// tool's doom-loop identity.
+	loopKey ToolLoopKey
+}
 
 func (b mcpBrand) isMcpTool() {}
+
+// ToAPITool forwards the wrapped tool's wire shape, substituting the MCP
+// server's own JSON Schema (sanitized) for the parameters when one was
+// supplied via McpMarkOptions.WireInputSchema and its root is an object.
+func (b mcpBrand) ToAPITool() components.ResponsesRequestToolUnion {
+	out := b.Tool.ToAPITool()
+	if b.wireInputSchema == nil || !isObjectRootSchema(b.wireInputSchema) || out.ResponsesRequestToolFunction == nil {
+		return out
+	}
+	fn := *out.ResponsesRequestToolFunction
+	fn.Parameters = SanitizeSchema(b.wireInputSchema)
+	return components.CreateResponsesRequestToolUnionFunction(fn)
+}
 
 func (b mcpBrand) Execute(ctx context.Context, raw json.RawMessage, execCtx ToolExecuteContext) (ToolExecutionResult, error) {
 	exec, ok := b.Tool.(ToolWithExecute)
@@ -275,8 +466,53 @@ type mcpMarked interface{ isMcpTool() }
 // classification (and downstream Source discrimination on
 // ToolExecutionResult/ToolStreamEvent) now identifies it as MCP-originated.
 // Intended for use by an MCP integration package that wraps remote tools.
-func MarkMcp(t Tool) Tool {
-	return mcpBrand{Tool: t}
+//
+// McpMarkOptions.WireInputSchema is the server's own JSON Schema for the
+// tool's arguments: it is serialized to the model in place of the schema
+// derived for validation, which keeps validating the call.
+//
+// McpMarkOptions.LoopKey attaches a doom-loop identity to the wrapped tool —
+// the injection point for MCP tools, whose remote definitions cannot carry
+// client-side functions.
+func MarkMcp(t Tool, opts ...McpMarkOptions) Tool {
+	b := mcpBrand{Tool: t}
+	for _, o := range opts {
+		if o.WireInputSchema != nil {
+			b.wireInputSchema = copyMap(o.WireInputSchema)
+		}
+		if o.LoopKey != nil {
+			b.loopKey = o.LoopKey
+		}
+	}
+	return b
+}
+
+// McpMarkOptions configures MarkMcp.
+type McpMarkOptions struct {
+	WireInputSchema map[string]any
+	// LoopKey is the tool's doom-loop identity (see ToolLoopKey); nil keeps
+	// the wrapped tool's own.
+	LoopKey ToolLoopKey
+}
+
+// toolLoopKey returns the doom-loop identity declared for t: the outermost
+// MarkMcp LoopKey, else the concrete tool's ToolConfig.LoopKey, else nil
+// (full arguments).
+func toolLoopKey(t Tool) ToolLoopKey {
+	for {
+		b, ok := t.(mcpBrand)
+		if !ok {
+			break
+		}
+		if b.loopKey != nil {
+			return b.loopKey
+		}
+		t = b.Tool
+	}
+	if lk, ok := t.(interface{ loopKey() ToolLoopKey }); ok {
+		return lk.loopKey()
+	}
+	return nil
 }
 
 // IsMcpTool reports whether tool carries the additive MCP brand (see MarkMcp).

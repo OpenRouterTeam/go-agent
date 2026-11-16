@@ -19,8 +19,30 @@ const (
 )
 
 type ToolApprovalCheck func(context.Context, ParsedToolCall, TurnContext) (bool, error)
-type ToModelOutputFunction func(any) (any, error)
-type ToModelOutputResult struct{ Output any }
+
+// ToModelOutputInput is what a model-output mapper receives: the tool's
+// successful output and the (decoded) input it ran on.
+type ToModelOutputInput struct {
+	Output any
+	Input  any
+}
+
+// ToModelOutputFunction converts a tool's execution output to model-facing
+// output. ToolConfig[In].ToModelOutput is the typed form.
+type ToModelOutputFunction func(context.Context, ToModelOutputInput) (ToModelOutputResult, error)
+
+// ToModelOutputResult is the result of a model-output mapper. Type
+// "content" sends Value (an array of content parts) as the
+// function_call_output; any other Type falls back to the JSON-encoded output.
+type ToModelOutputResult struct {
+	Type  string
+	Value []ToolOutputContentItem
+}
+
+// ContentModelOutput builds a "content" ToModelOutputResult.
+func ContentModelOutput(items ...ToolOutputContentItem) ToModelOutputResult {
+	return ToModelOutputResult{Type: "content", Value: items}
+}
 
 type Tool interface {
 	ToolName() string
@@ -127,7 +149,16 @@ type ParsedToolCall struct {
 	Name      string
 	Arguments any
 	RawArgs   string
+	// PreToolUseApplied marks a persisted pending call whose Arguments
+	// already carry the PreToolUse hook's effective input, so a resume
+	// does not run the hook a second time. Additive: legacy state without
+	// the marker keeps the prior behavior (the hook runs on resume).
+	PreToolUseApplied bool `json:",omitempty"`
 }
+
+// PendingToolCall is a ParsedToolCall persisted on ConversationState while
+// awaiting a decision (see ParsedToolCall.PreToolUseApplied).
+type PendingToolCall = ParsedToolCall
 
 type TypedToolCall = ParsedToolCall
 type TypedToolCallUnion = ParsedToolCall
@@ -140,7 +171,6 @@ type ToolExecutionResult struct {
 	Source ToolSource
 	Output any
 	Error  error
-	Events []any
 }
 
 type ToolExecutionResultUnion = ToolExecutionResult
@@ -220,8 +250,20 @@ type ConversationState struct {
 	PartialResponse    *PartialResponse
 	InterruptedBy      *string
 	Status             ConversationStatus
-	CreatedAt          int64
-	UpdatedAt          int64
+	// ConsumedForcedToolChoiceKey records that a forced caller tool choice
+	// (`required`, a specific tool, or allowed_tools in required mode) has
+	// already produced a tool call in this logical run, so follow-up turns
+	// (including after a pause/resume) relax it to `auto`. Cleared when the
+	// run completes. Additive within version 1.
+	ConsumedForcedToolChoiceKey string `json:",omitempty"`
+	// DoomLoop is the doom-loop detector snapshot (streaks, escalation
+	// budget, plus the engine-owned stop verdict and queued steer guidance),
+	// written on every save when CallModelInput.DoomLoop is set so loop
+	// memory survives serialize -> resume. Absent when detection is off.
+	// Additive within version 1.
+	DoomLoop  *DoomLoopSerializedState `json:",omitempty"`
+	CreatedAt int64
+	UpdatedAt int64
 }
 
 type StateAccessor interface {
@@ -260,8 +302,8 @@ func HasApprovalRequiredTools(tools []Tool) bool {
 	}
 	return false
 }
-func IsToolCallOutputEvent(e ToolStreamEvent) bool        { return e.Type == "tool.call.output" }
-func IsToolPreliminaryResultEvent(e ToolStreamEvent) bool { return e.Type == "tool.preliminary" }
+func IsToolCallOutputEvent(e ToolStreamEvent) bool        { return e.Type == "tool.call_output" }
+func IsToolPreliminaryResultEvent(e ToolStreamEvent) bool { return e.Type == "tool.preliminary_result" }
 func IsToolResultEvent(e ToolStreamEvent) bool            { return e.Type == "tool.result" }
 func IsTurnStartEvent(e ResponseStreamEvent) bool         { return e.Type == "turn.start" }
 func IsTurnEndEvent(e ResponseStreamEvent) bool           { return e.Type == "turn.end" }

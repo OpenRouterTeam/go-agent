@@ -2,6 +2,7 @@ package agent
 
 import (
 	"context"
+	"time"
 
 	"github.com/OpenRouterTeam/go-sdk/models/components"
 )
@@ -41,6 +42,30 @@ type CallModelInput struct {
 	// Hooks accepts either a *HooksManager or an InlineHookConfig. See
 	// ResolveHooks. nil means no hooks.
 	Hooks any
+	// ActiveTools filters which of Tools are sent to the model and may be
+	// executed for this call, by tool ID (a client tool's name, or a server
+	// tool's ID — see ToolID). nil means no filtering; a non-nil list (even
+	// empty) keeps only the listed client tools. Server tools are always
+	// kept, and unknown IDs are ignored. Typically set from a resolved
+	// ToolSet (ResolvedToolSet.CallModel). Never sent on the wire.
+	ActiveTools []string
+	// DoomLoop enables doom-loop detection: runs that repeat the same tool
+	// call with identical arguments (including repeated empty calls) or
+	// emit the same text over and over get a graduated response (observe ->
+	// steer -> escalate -> block -> stop). nil (the default) disables it
+	// entirely (upstream `false`/absent); &DoomLoopConfig{} enables the
+	// recommended defaults (upstream `true`).
+	DoomLoop *DoomLoopConfig
+	// StreamReplay selects how much stream history ModelResult's fan-out
+	// streams retain for consumers: StreamReplayFull (the default, "") keeps
+	// everything so a late subscriber replays the whole run;
+	// StreamReplayActiveConsumers retains only what currently attached
+	// consumers still need, so late subscribers start at the trim point.
+	// Client-side only; never sent on the wire.
+	StreamReplay StreamReplay
+	// ToolTimeout is the default deadline for each tool execution in the
+	// run; ToolConfig.Timeout overrides it per tool. Zero means none.
+	ToolTimeout time.Duration
 }
 
 type CallModelInputWithState = CallModelInput

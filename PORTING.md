@@ -112,6 +112,51 @@ marks the title `do not merge`.
 
 Never hand-edit `state.yaml` to make a run look successful.
 
+## Upstream work not yet ported
+
+`state.yaml` records the last upstream commit that was synced, not proof that
+every feature up to that commit exists here. The upstream features below were
+deliberately left out of the sync that brought the port to upstream
+`6a8c4ea` (`@openrouter/agent` 1.2.1 plus later fixes). A later sync will not
+pick them up automatically because the delta has already moved past them, so
+they stay listed here until they are ported or the contract excludes them.
+
+- **Unified `run()` tools with `background` / `deferred` lifecycles**
+  (upstream #90, `e8d7d6d`): the task check-in tool, `sendToTask` steering,
+  `tool.agent()` subagents, `resumeToolResults`, and the round/per-tool
+  concurrency caps (`toolConcurrency`, `maxConcurrency`).
+  - State impact: the `awaiting_async_tools` status and the
+    `pendingAsyncTools` / `settledAsyncCallIds` state fields are not modeled.
+    A TypeScript-written state that uses them loads without error and those
+    fields are dropped.
+  - Already ported from #90: execute-context call/conversation IDs, tool
+    timeouts, cancellation of in-flight tools, and `QueueUserMessage`.
+- **MCP integration** (`packages/agent/src/mcp/`, moved there from
+  `packages/mcp/` upstream): excluded by the contract's Scope section.
+  Adding it is a contract change.
+- **No Go equivalent:**
+  - Tool-context setters storing schema-parsed values (`efba739`): Go tool
+    context has no schema.
+  - `validateFinalResponse` wording (`5a7ed03`): Go never hard-fails on an
+    empty final output.
+
+These new mappings should be added to the contract's naming map:
+
+| TypeScript | Go |
+| --- | --- |
+| `result.getUsage()` | `result.Usage(ctx)` |
+| `result.queueUserMessage` | `result.QueueUserMessage` |
+| `activeTools` | `CallModelInput.ActiveTools` |
+| `streamReplay` | `CallModelInput.StreamReplay` |
+| `doomLoop` | `CallModelInput.DoomLoop` |
+| `toolTimeoutMs` / `timeoutMs` | `CallModelInput.ToolTimeout` / `ToolConfig.Timeout` |
+| `ctx.callId` / `ctx.conversationId` / `ctx.signal` | `ToolExecuteContext.CallID` / `ConversationID` / the tool's `ctx` |
+| `toModelOutput` / `wireInputSchema` / `strict` / `loopKey` | `ToolConfig.ToModelOutput` / `WireInputSchema` / `Strict` / `LoopKey` |
+| `createToolSet` | `NewToolSet` |
+
+The contract itself (`.upstreamer/upstreamer.md`) is owned by the repo and is
+not rewritten by port runs, so a maintainer should copy this list into it.
+
 ## Running it locally
 
 ```bash

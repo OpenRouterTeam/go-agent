@@ -1,6 +1,11 @@
 package agent
 
-import "sync"
+import (
+	"encoding/json"
+	"sync"
+
+	"github.com/OpenRouterTeam/go-sdk/models/components"
+)
 
 const SharedContextKey = "shared"
 
@@ -57,6 +62,13 @@ func (s *ToolContextStore) Subscribe(listener func(string, map[string]any)) {
 }
 
 func BuildToolExecuteContext(call ParsedToolCall, turn TurnContext, store *ToolContextStore, emit func(any)) ToolExecuteContext {
+	// TurnContext.ToolCall is part of the tool-facing contract, but the
+	// streaming loop builds its turn context without one. Every executor
+	// path has the call in hand, so thread it: a caller-provided ToolCall
+	// wins, the executed call fills the gap otherwise (upstream #91).
+	if turn.ToolCall == nil && (call.CallID != "" || call.Name != "") {
+		turn.ToolCall = toFunctionCallItem(call)
+	}
 	var local, shared map[string]any
 	if store != nil {
 		local = store.Get(call.Name)
@@ -112,4 +124,26 @@ func copyAnyMap(in map[string]any) map[string]any {
 		out[k] = v
 	}
 	return out
+}
+
+// toFunctionCallItem converts an executor ParsedToolCall back into the
+// wire-shaped item TurnContext.ToolCall declares. Arguments are
+// re-serialized from the parsed value when present, so the string is
+// semantically equal to the wire arguments but not guaranteed byte-identical.
+func toFunctionCallItem(call ParsedToolCall) *components.OutputFunctionCallItem {
+	args := call.RawArgs
+	if call.Arguments != nil {
+		if b, err := json.Marshal(call.Arguments); err == nil {
+			args = string(b)
+		}
+	}
+	if args == "" {
+		args = "{}"
+	}
+	item := &components.OutputFunctionCallItem{Arguments: args, CallID: call.CallID, Name: call.Name, Type: components.OutputFunctionCallItemTypeFunctionCall}
+	if call.ID != "" {
+		id := call.ID
+		item.ID = &id
+	}
+	return item
 }

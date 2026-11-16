@@ -16,6 +16,7 @@ type InlineHookConfig struct {
 	SessionStart       []HookEntry[SessionStartPayload, EmptyHookResult]
 	SessionEnd         []HookEntry[SessionEndPayload, EmptyHookResult]
 	PostModelCall      []HookEntry[PostModelCallPayload, EmptyHookResult]
+	DoomLoopDetected   []HookEntry[DoomLoopDetectedPayload, DoomLoopDetectedResult]
 }
 
 // ResolveHooks normalizes a CallModelInput.Hooks value into a *HooksManager.
@@ -61,6 +62,9 @@ func ResolveHooks(hooks any) *HooksManager {
 		}
 		for _, e := range v.PostModelCall {
 			manager.OnPostModelCall(e)
+		}
+		for _, e := range v.DoomLoopDetected {
+			manager.OnDoomLoopDetected(e)
 		}
 		return manager
 	default:
