@@ -16,6 +16,7 @@ const (
 	HookNameSessionStart       HookName = "SessionStart"
 	HookNameSessionEnd         HookName = "SessionEnd"
 	HookNamePostModelCall      HookName = "PostModelCall"
+	HookNameDoomLoopDetected   HookName = "DoomLoopDetected"
 )
 
 // builtInHookNames mirrors upstream's BUILT_IN_HOOK_NAMES set, used by
@@ -31,9 +32,10 @@ var builtInHookNames = map[string]bool{
 	string(HookNameSessionStart):       true,
 	string(HookNameSessionEnd):         true,
 	string(HookNamePostModelCall):      true,
+	string(HookNameDoomLoopDetected):   true,
 }
 
-// IsBuiltInHookName reports whether name is one of the nine built-in hooks.
+// IsBuiltInHookName reports whether name is one of the ten built-in hooks.
 func IsBuiltInHookName(name string) bool { return builtInHookNames[name] }
 
 //#region Payload & Result types
@@ -204,6 +206,9 @@ const (
 	SessionEndReasonError    SessionEndReason = "error"
 	SessionEndReasonMaxTurns SessionEndReason = "max_turns"
 	SessionEndReasonComplete SessionEndReason = "complete"
+	// SessionEndReasonDoomLoop reports a run halted by a doom-loop stop
+	// verdict (see CallModelInput.DoomLoop).
+	SessionEndReasonDoomLoop SessionEndReason = "doom_loop"
 )
 
 // SessionEndPayload is delivered exactly once per run that reached
@@ -233,6 +238,38 @@ type PostModelCallPayload struct {
 	TurnType   ModelCallTurnType
 	TurnNumber int
 	Usage      *ModelCallUsage
+}
+
+// DoomLoopDetectedPayload is delivered when doom-loop detection (see
+// CallModelInput.DoomLoop) crosses a ladder rung.
+type DoomLoopDetectedPayload struct {
+	// Detector is which detector fired: identical client/server tool calls,
+	// or repeated text.
+	Detector DoomLoopDetectorKind
+	// Action is the ladder action the engine resolved for this streak.
+	Action DoomLoopAction
+	// Streak is the consecutive repetition count that crossed a ladder rung.
+	Streak int
+	// Fingerprint is the deterministic fingerprint of the repeated unit.
+	Fingerprint string
+	// ToolName is set for tool-fingerprint and server-tool verdicts.
+	ToolName string
+	// ToolInput is set for tool-fingerprint verdicts whose arguments are a
+	// JSON object: the repeated call's arguments.
+	ToolInput map[string]any
+	// Message is the explanation used for block outputs / steer messages.
+	Message string
+}
+
+// DoomLoopDetectedResult lets a handler override the engine's resolved
+// action for this event: de-escalate (DoomLoopActionObserve on a would-be
+// block) or escalate (DoomLoopActionStop immediately). The last non-empty
+// override in the chain wins. Text and server-tool verdicts cannot be
+// blocked: a block override on them downgrades to observe. An escalate
+// override is honored only when an escalation config exists with budget
+// remaining; otherwise it downgrades to observe.
+type DoomLoopDetectedResult struct {
+	OverrideAction DoomLoopAction
 }
 
 // EmptyHookResult is the result type for observation-only hooks

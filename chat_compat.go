@@ -36,11 +36,24 @@ func FromChatMessages(messages []ChatMessage) ([]components.InputsUnion1, error)
 			out = append(out, components.CreateInputsUnion1FunctionCallOutputItem(components.FunctionCallOutputItem{CallID: m.ToolCallID, Output: components.CreateFunctionCallOutputItemOutputUnion2Str(result), Type: components.FunctionCallOutputItemTypeFunctionCallOutputFunctionCallOutput}))
 			continue
 		}
+		// An assistant message with no content is omitted only when tool
+		// calls replace it; a content-less assistant message with no tool
+		// calls still round-trips as an empty message.
+		emptyContent := m.Content == nil
 		if text, ok := m.Content.(string); ok {
-			out = append(out, easyMessage(m.Role, components.CreateEasyInputMessageContentUnion2Str(text)))
-		} else {
-			out = append(out, easyMessage(m.Role, components.CreateEasyInputMessageContentUnion2Any(m.Content)))
+			emptyContent = text == ""
 		}
+		if m.Role != "assistant" || !emptyContent || len(m.ToolCalls) == 0 {
+			if text, ok := m.Content.(string); ok {
+				out = append(out, easyMessage(m.Role, components.CreateEasyInputMessageContentUnion2Str(text)))
+			} else if m.Content == nil {
+				out = append(out, easyMessage(m.Role, components.CreateEasyInputMessageContentUnion2Str("")))
+			} else {
+				out = append(out, easyMessage(m.Role, components.CreateEasyInputMessageContentUnion2Any(m.Content)))
+			}
+		}
+		// One function_call item per tool call; already-serialized
+		// arguments (RawArgs) are forwarded as-is.
 		for _, call := range m.ToolCalls {
 			args := call.RawArgs
 			if args == "" && call.Arguments != nil {
@@ -50,7 +63,12 @@ func FromChatMessages(messages []ChatMessage) ([]components.InputsUnion1, error)
 				}
 				args = string(b)
 			}
-			out = append(out, components.CreateInputsUnion1FunctionCallItem(components.FunctionCallItem{ID: callKey(call), CallID: call.CallID, Name: call.Name, Arguments: args, Type: components.FunctionCallItemTypeFunctionCall}))
+			callID := call.CallID
+			if callID == "" {
+				callID = call.ID
+			}
+			status := components.ToolCallStatusCompleted
+			out = append(out, components.CreateInputsUnion1FunctionCallItem(components.FunctionCallItem{ID: callKey(call), CallID: callID, Name: call.Name, Arguments: args, Status: &status, Type: components.FunctionCallItemTypeFunctionCall}))
 		}
 	}
 	return out, nil

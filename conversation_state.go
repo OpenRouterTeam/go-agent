@@ -165,23 +165,80 @@ func AppendToMessages(state ConversationState, items ...components.InputsUnion1)
 	return UpdateState(state, func(s *ConversationState) { s.Messages = append(s.Messages, items...) })
 }
 
+// ToolRequiresApproval reports whether call needs human approval.
+//
+// A call-level check always takes precedence; it receives the arguments
+// normalized exactly as the tool's Execute would decode them when they are
+// valid, and the raw call otherwise. A tool-level approval predicate
+// (ToolConfig.Approval) receives the normalized arguments too, and fails
+// closed (requires approval) when they do not decode/validate or are not an
+// object: there is no trustworthy value for it to judge, and a PreToolUse
+// hook may later repair the input into an executable call. t may be nil
+// (an unknown tool name), in which case only a call-level check applies.
 func ToolRequiresApproval(ctx context.Context, t Tool, call ParsedToolCall, turn TurnContext, callLevel ToolApprovalCheck) (bool, error) {
-	if IsServerTool(t) {
+	if t != nil && IsServerTool(t) {
 		return false, nil
 	}
 	if callLevel != nil {
+		if t != nil {
+			if norm, ok := normalizedToolCall(t, call); ok {
+				return callLevel(ctx, norm, turn)
+			}
+		}
 		return callLevel(ctx, call, turn)
 	}
+	if t == nil {
+		return false, nil
+	}
+	if hasToolApprovalPredicate(t) {
+		norm, ok := normalizedToolCall(t, call)
+		if !ok {
+			return true, nil
+		}
+		return t.RequiresApproval(ctx, norm, turn)
+	}
 	return t.RequiresApproval(ctx, call, turn)
+}
+
+// normalizedToolCall returns a copy of call whose Arguments are the values
+// the tool body would receive. ok is false when the tool cannot normalize
+// (not a typed tool) or the arguments are invalid / not an object.
+func normalizedToolCall(t Tool, call ParsedToolCall) (ParsedToolCall, bool) {
+	n, ok := unwrapTool(t).(interface {
+		normalizeArguments(json.RawMessage) (map[string]any, bool)
+	})
+	if !ok {
+		return call, false
+	}
+	raw, err := callArgumentsJSON(call)
+	if err != nil {
+		return call, false
+	}
+	args, ok := n.normalizeArguments(raw)
+	if !ok {
+		return call, false
+	}
+	norm := call
+	norm.Arguments = args
+	norm.RawArgs = ""
+	return norm, true
+}
+
+// hasBlanketApproval reports whether t requires approval unconditionally
+// (ToolConfig.RequireApproval without a predicate).
+func hasBlanketApproval(t Tool) bool {
+	b, ok := unwrapTool(t).(interface{ hasBlanketApproval() bool })
+	return ok && b.hasBlanketApproval()
+}
+
+func hasToolApprovalPredicate(t Tool) bool {
+	p, ok := unwrapTool(t).(interface{ hasApprovalPredicate() bool })
+	return ok && p.hasApprovalPredicate()
 }
 
 func PartitionToolCalls(ctx context.Context, tools []Tool, calls []ParsedToolCall, turn TurnContext, callLevel ToolApprovalCheck) (approved []ParsedToolCall, pending []ParsedToolCall, err error) {
 	for _, call := range calls {
 		t := FindToolByName(tools, call.Name)
-		if t == nil {
-			approved = append(approved, call)
-			continue
-		}
 		req, err := ToolRequiresApproval(ctx, t, call, turn, callLevel)
 		if err != nil {
 			return nil, nil, err
@@ -202,6 +259,49 @@ func CreateRejectedResult(call ParsedToolCall, reason string) UnsentToolResult {
 	return UnsentToolResult{CallID: call.CallID, Name: call.Name, Error: reason}
 }
 
+// IsContentArray reports whether value is a non-empty array of tool output
+// content parts (input_text / input_image / input_file), which is sent to the
+// model as the array form of function_call_output rather than JSON-encoded.
+func IsContentArray(value any) bool {
+	_, ok := asContentArray(value)
+	return ok
+}
+
+// asContentArray returns value as content parts. It accepts the typed form
+// produced by ToModelOutput and the generic []any form a content array takes
+// after a ConversationState JSON round trip.
+func asContentArray(value any) ([]ToolOutputContentItem, bool) {
+	switch v := value.(type) {
+	case []ToolOutputContentItem:
+		return v, len(v) > 0
+	case []any:
+		if len(v) == 0 {
+			return nil, false
+		}
+		for _, item := range v {
+			m, ok := item.(map[string]any)
+			if !ok {
+				return nil, false
+			}
+			switch m["type"] {
+			case "input_text", "input_image", "input_file":
+			default:
+				return nil, false
+			}
+		}
+		b, err := json.Marshal(v)
+		if err != nil {
+			return nil, false
+		}
+		var items []ToolOutputContentItem
+		if err := json.Unmarshal(b, &items); err != nil {
+			return nil, false
+		}
+		return items, true
+	}
+	return nil, false
+}
+
 func UnsentResultsToAPIFormat(results []UnsentToolResult) []components.InputsUnion1 {
 	items, err := UnsentResultsToAPIFormatWithError(results)
 	if err != nil {
@@ -216,6 +316,10 @@ func UnsentResultsToAPIFormatWithError(results []UnsentToolResult) ([]components
 		out := r.Output
 		if r.Error != "" {
 			out = map[string]any{"error": r.Error}
+		} else if content, ok := asContentArray(out); ok {
+			item := components.FunctionCallOutputItem{CallID: r.CallID, Output: components.CreateFunctionCallOutputItemOutputUnion2ArrayOfFunctionCallOutputItemOutputUnion1(content), Type: components.FunctionCallOutputItemTypeFunctionCallOutputFunctionCallOutput}
+			items = append(items, components.CreateInputsUnion1FunctionCallOutputItem(item))
+			continue
 		}
 		var s string
 		if str, ok := out.(string); ok {

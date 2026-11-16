@@ -111,8 +111,10 @@ func TestApprovalResumeReplaysFunctionCallBeforeOutput(t *testing.T) {
 		t.Fatal(err)
 	}
 	items := resumeSender.requests[0].Input.ArrayOfInputsUnion1
-	if len(items) < 2 || (items[0].FunctionCallItem == nil && items[0].OutputFunctionCallItem == nil) || items[1].FunctionCallOutputItem == nil {
-		t.Fatalf("resume input must replay function_call before function_call_output: %#v", items)
+	// The original user turn is persisted with the first response (upstream
+	// pendingFreshItems), then the function_call, then its output.
+	if len(items) != 3 || items[0].EasyInputMessage == nil || (items[1].FunctionCallItem == nil && items[1].OutputFunctionCallItem == nil) || items[2].FunctionCallOutputItem == nil {
+		t.Fatalf("resume input must replay user input, then function_call before function_call_output: %#v", items)
 	}
 	// previous_response_id must NOT go on the wire: the live Responses API
 	// rejects it on stateless requests ("expected null, received string").

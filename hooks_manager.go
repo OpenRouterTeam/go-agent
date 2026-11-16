@@ -8,7 +8,7 @@ import (
 )
 
 // HooksManager is a typed, extensible hook system for agent lifecycle
-// events (upstream #7/#67, the 0.8.0 headline). Supports both the nine
+// events (upstream #7/#67, the 0.8.0 headline). Supports both the ten
 // built-in hooks (PreToolUse, PostToolUse, ...) and user-defined custom
 // hooks registered via the package-level generic On/Emit functions (Go's
 // generics stand-in for upstream's `AllHooks<Custom>` conditional-type
@@ -388,6 +388,14 @@ func (m *HooksManager) OnPostModelCall(entry HookEntry[PostModelCallPayload, Emp
 
 func (m *HooksManager) EmitPostModelCall(payload PostModelCallPayload, opts EmitOptions) (EmitResult[EmptyHookResult, PostModelCallPayload], error) {
 	return emitTyped[PostModelCallPayload, EmptyHookResult](m, string(HookNamePostModelCall), payload, opts)
+}
+
+func (m *HooksManager) OnDoomLoopDetected(entry HookEntry[DoomLoopDetectedPayload, DoomLoopDetectedResult]) func() {
+	return On(m, string(HookNameDoomLoopDetected), entry)
+}
+
+func (m *HooksManager) EmitDoomLoopDetected(payload DoomLoopDetectedPayload, opts EmitOptions) (EmitResult[DoomLoopDetectedResult, DoomLoopDetectedPayload], error) {
+	return emitTyped[DoomLoopDetectedPayload, DoomLoopDetectedResult](m, string(HookNameDoomLoopDetected), payload, opts)
 }
 
 //#endregion

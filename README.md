@@ -78,6 +78,16 @@ Additional consumers include `Response`, `FullResponsesStream`, `ReasoningStream
 
 Tool input schemas are generated from Go structs with `invopop/jsonschema`, sanitized to remove upstream-internal `~` keys, and checked before execution. Dynamic `map[string]any` remains available at JSON boundaries.
 
+Per-tool options on `ToolConfig`: `Strict` (serialized `strict`; omitted when nil), `WireInputSchema` (manual tools: send a caller-owned JSON Schema verbatim), `ToModelOutput` (map a result to content parts sent to the model), `NextTurnParams` (change model/temperature/toolChoice/... for the next turn after a successful call), `Timeout`, and `LoopKey` (doom-loop identity). `NewToolSet` builds declarative activate/deactivate/situation rules whose resolved snapshot feeds `CallModelInput.Tools` and `CallModelInput.ActiveTools`.
+
+## Run Controls
+
+- `ModelResult.Usage(ctx)` aggregates token/cost usage across every model call in the run.
+- `CallModelInput.DoomLoop` (`&agent.DoomLoopConfig{}` for defaults) detects repeated identical tool calls and repeated text and responds with a graduated ladder (observe, steer, escalate, block, stop); the `DoomLoopDetected` hook can override the action.
+- A forced `tool_choice` (`required`, a specific tool, or `allowed_tools` in required mode) applies until a tool call is made, then relaxes to `auto` for follow-up turns.
+- A response truncated at `max_output_tokens` never executes its tool calls.
+- `ModelResult.QueueUserMessage` injects a user message at the next safe turn boundary; `CallModelInput.ToolTimeout` / `ToolConfig.Timeout` bound tool execution; `CallModelInput.StreamReplay` controls stream history retention.
+
 ## State, Approval, And Context
 
 Use `CreateInitialState`, `AppendToMessages`, `UpdateState`, `PartitionToolCalls`, and `StateAccessor` to persist multi-turn conversations. Approval checks can be configured per tool or per call; resume by passing `ApproveToolCalls` or `RejectToolCalls` with the saved state. go-agent replays the original `function_call` before its `function_call_output` and carries `previous_response_id`, matching the TypeScript resume shape. `ToolContextStore` provides concurrency-safe per-tool and shared context with snapshot, get, set, merge, and subscribe operations. Unresolved manual (client-executed) tool calls pause the run with `ConversationStatusAwaitingClientTools`, distinct from `ConversationStatusAwaitingHITL`.
@@ -92,7 +102,7 @@ Use `StepCountIs`, `HasToolCall`, `MaxTokensUsed`, `MaxCost`, `FinishReasonIs`, 
 
 ## Lifecycle Hooks
 
-`HooksManager` (`agent.NewHooksManager`) supports the nine built-in lifecycle hooks — `PreToolUse`, `PostToolUse`, `PostToolUseFailure`, `UserPromptSubmit`, `Stop`, `PermissionRequest`, `SessionStart`, `SessionEnd`, and `PostModelCall` — plus fully custom hooks via the generic `agent.On`/`agent.Emit`. Register handlers with the typed `OnXxx` methods (e.g. `manager.OnPreToolUse(...)`) and pass the manager on `CallModelInput.Hooks`:
+`HooksManager` (`agent.NewHooksManager`) supports the ten built-in lifecycle hooks — `PreToolUse`, `PostToolUse`, `PostToolUseFailure`, `UserPromptSubmit`, `Stop`, `PermissionRequest`, `SessionStart`, `SessionEnd`, `PostModelCall`, and `DoomLoopDetected` — plus fully custom hooks via the generic `agent.On`/`agent.Emit`. Register handlers with the typed `OnXxx` methods (e.g. `manager.OnPreToolUse(...)`) and pass the manager on `CallModelInput.Hooks`:
 
 ```go
 hooks := agent.NewHooksManager()
