@@ -138,6 +138,13 @@ func executeHandlerChain(entries []*erasedEntry, initialPayload any, hctx Lifecy
 
 	for i, entry := range entries {
 		if hctx.Ctx != nil && hctx.Ctx.Err() != nil {
+			// A hook that can block (PreToolUse, UserPromptSubmit) fails
+			// closed: the handlers left unrun may include the guard that
+			// would have blocked, so an aborted chain must not read as an
+			// approval (upstream #160).
+			if hasBehavior && behavior.isBlocked != nil {
+				blocked = true
+			}
 			break
 		}
 

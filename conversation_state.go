@@ -166,11 +166,24 @@ func AppendToMessages(state ConversationState, items ...components.InputsUnion1)
 }
 
 func ToolRequiresApproval(ctx context.Context, t Tool, call ParsedToolCall, turn TurnContext, callLevel ToolApprovalCheck) (bool, error) {
-	if IsServerTool(t) {
+	if t != nil && IsServerTool(t) {
 		return false, nil
 	}
+	// Call-level checks take precedence. They receive the call as the tool
+	// will execute it (decoded and re-encoded) when the arguments parse, and
+	// the raw call otherwise — call-level checks remain unconditional
+	// (upstream #94). Tool-level predicates do their own parsing and fail
+	// closed on invalid arguments; see TypedTool.RequiresApproval.
 	if callLevel != nil {
+		if p, ok := t.(toolInputParser); ok {
+			if normalized, ok := p.normalizedCall(call); ok {
+				return callLevel(ctx, normalized, turn)
+			}
+		}
 		return callLevel(ctx, call, turn)
+	}
+	if t == nil {
+		return false, nil
 	}
 	return t.RequiresApproval(ctx, call, turn)
 }
@@ -178,7 +191,7 @@ func ToolRequiresApproval(ctx context.Context, t Tool, call ParsedToolCall, turn
 func PartitionToolCalls(ctx context.Context, tools []Tool, calls []ParsedToolCall, turn TurnContext, callLevel ToolApprovalCheck) (approved []ParsedToolCall, pending []ParsedToolCall, err error) {
 	for _, call := range calls {
 		t := FindToolByName(tools, call.Name)
-		if t == nil {
+		if t == nil && callLevel == nil {
 			approved = append(approved, call)
 			continue
 		}
@@ -216,6 +229,12 @@ func UnsentResultsToAPIFormatWithError(results []UnsentToolResult) ([]components
 		out := r.Output
 		if r.Error != "" {
 			out = map[string]any{"error": r.Error}
+		} else if content, ok := asContentArray(out); ok {
+			// Content arrays (ToModelOutput results: images, text blocks,
+			// files) pass through as structured output, as upstream does.
+			item := components.FunctionCallOutputItem{CallID: r.CallID, Output: components.CreateFunctionCallOutputItemOutputUnion2ArrayOfFunctionCallOutputItemOutputUnion1(content), Type: components.FunctionCallOutputItemTypeFunctionCallOutputFunctionCallOutput}
+			items = append(items, components.CreateInputsUnion1FunctionCallOutputItem(item))
+			continue
 		}
 		var s string
 		if str, ok := out.(string); ok {
@@ -231,4 +250,41 @@ func UnsentResultsToAPIFormatWithError(results []UnsentToolResult) ([]components
 		items = append(items, components.CreateInputsUnion1FunctionCallOutputItem(item))
 	}
 	return items, nil
+}
+
+// asContentArray reports whether v is a tool-output content array (the
+// ToModelOutput result shape), either typed or as the []any a JSON round
+// trip of persisted state produces. Mirrors upstream's isContentArray: every
+// element must be an object whose type is input_text, input_image, or
+// input_file.
+func asContentArray(v any) ([]ToolOutputContentItem, bool) {
+	switch x := v.(type) {
+	case []ToolOutputContentItem:
+		return x, true
+	case []any:
+		if len(x) == 0 {
+			return nil, false
+		}
+		for _, el := range x {
+			m, ok := el.(map[string]any)
+			if !ok {
+				return nil, false
+			}
+			switch m["type"] {
+			case "input_text", "input_image", "input_file":
+			default:
+				return nil, false
+			}
+		}
+		b, err := json.Marshal(x)
+		if err != nil {
+			return nil, false
+		}
+		var out []ToolOutputContentItem
+		if err := json.Unmarshal(b, &out); err != nil {
+			return nil, false
+		}
+		return out, true
+	}
+	return nil, false
 }

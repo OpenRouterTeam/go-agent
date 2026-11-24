@@ -32,7 +32,34 @@ func ExtractTextFromResponse(resp components.OpenResponsesResult) string {
 	return b.String()
 }
 
+// isTruncatedAtMaxOutputTokens reports whether the provider stopped resp at
+// max_output_tokens. The function_call items on such a response are an
+// unfinished batch: the model asked for the set together and the last one
+// carries whatever argument prefix fit in the budget. Executing the complete
+// ones would hand the model a result set with a silent hole and spend side
+// effects on a turn that truncates the same way on the same budget, so none
+// of them run (upstream #125). The caller still sees every output item and
+// IncompleteDetails on the response.
+func isTruncatedAtMaxOutputTokens(resp components.OpenResponsesResult) bool {
+	return resp.Status == components.OpenAIResponsesResponseStatusIncomplete &&
+		resp.IncompleteDetails != nil && resp.IncompleteDetails.Reason != nil &&
+		*resp.IncompleteDetails.Reason == components.ReasonMaxOutputTokens
+}
+
+// ExtractToolCallsFromResponse returns the function calls the loop should
+// execute. A response truncated at max_output_tokens yields none, even when
+// its output carries (possibly complete) function_call items.
 func ExtractToolCallsFromResponse(resp components.OpenResponsesResult) []ParsedToolCall {
+	if isTruncatedAtMaxOutputTokens(resp) {
+		return nil
+	}
+	return extractEmittedToolCalls(resp)
+}
+
+// extractEmittedToolCalls returns every function call the model emitted,
+// truncated or not. This is the ToolCallsStream consumer view, which upstream
+// keeps outside the truncation guard: it reports the model's emitted calls.
+func extractEmittedToolCalls(resp components.OpenResponsesResult) []ParsedToolCall {
 	var calls []ParsedToolCall
 	for _, item := range resp.Output {
 		if item.OutputFunctionCallItem == nil {
