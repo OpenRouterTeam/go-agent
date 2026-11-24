@@ -127,6 +127,12 @@ type ParsedToolCall struct {
 	Name      string
 	Arguments any
 	RawArgs   string
+	// PreToolUseApplied marks a pending call whose Arguments already carry
+	// the PreToolUse hook's effective input (upstream #94's additive
+	// `preToolUseApplied` marker). Resuming an approved call with this set
+	// does not run PreToolUse a second time; legacy state without the marker
+	// keeps its prior behavior (PreToolUse runs on resume).
+	PreToolUseApplied bool `json:",omitempty"`
 }
 
 type TypedToolCall = ParsedToolCall
@@ -140,6 +146,10 @@ type ToolExecutionResult struct {
 	Source ToolSource
 	Output any
 	Error  error
+	// Deprecated: generator yields are no longer accumulated (upstream
+	// #110). They are broadcast live as "tool.preliminary" events on
+	// ModelResult.ToolStream and through ToolExecuteContext.Emit; Events is
+	// always nil.
 	Events []any
 }
 
@@ -222,6 +232,13 @@ type ConversationState struct {
 	Status             ConversationStatus
 	CreatedAt          int64
 	UpdatedAt          int64
+	// ConsumedForcedToolChoiceKey records that a forced tool choice
+	// (`required`, a specific tool, or allowed_tools with mode `required`)
+	// already produced a tool call in this logical run, so follow-up turns
+	// send it relaxed to `auto` — including turns issued after an approval,
+	// HITL, or client-tool pause (upstream #100). Additive within version 1;
+	// cleared when the run completes.
+	ConsumedForcedToolChoiceKey string `json:",omitempty"`
 }
 
 type StateAccessor interface {
@@ -245,7 +262,16 @@ func HasExecuteFunction(t Tool) bool   { _, ok := t.(ToolWithExecute); return ok
 func IsRegularExecuteTool(t Tool) bool {
 	return t != nil && t.ToolType() == ToolTypeRegular && HasExecuteFunction(t)
 }
+// ToolHasApprovalConfigured reports whether t has an approval gate: a
+// blanket RequireApproval, or an Approval predicate (regardless of what the
+// predicate would answer for a particular call), matching upstream.
 func ToolHasApprovalConfigured(t Tool) bool {
+	if t == nil || IsServerTool(t) {
+		return false
+	}
+	if p, ok := t.(toolInputDependentApproval); ok && p.hasApprovalPredicate() {
+		return true
+	}
 	b, err := t.RequiresApproval(context.Background(), ParsedToolCall{}, TurnContext{})
 	if err != nil {
 		return false
